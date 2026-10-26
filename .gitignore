@@ -1,0 +1,15 @@
+node_modules/
+dist/
+.vite/
+.env
+.env.*
+!.env.example
+*.log
+contracts/out/
+contracts/cache/
+broadcast/
+coverage/
+.agents/
+activity-strip-preview.html
+console.jsonl
+traces.jsonl
