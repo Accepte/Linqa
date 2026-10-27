@@ -1149,12 +1149,10 @@ body {
 .fortune-panel.loss-panel .fortune-game-id, .fortune-panel.win-panel .fortune-game-id { background: transparent; }
 .fortune-panel.win-panel .fortune-game-id { margin-top: auto; margin-bottom: 6px; padding-top: 0; padding-bottom: 0; transform: none; }
 .fortune-game-id > span { flex: 0 0 auto; color: #E9EDF4; font-size: 15px; font-weight: 800; letter-spacing: 0; }
-.fortune-transaction > span { color: #B9C2D6; font-size: 8px; font-weight: 700; letter-spacing: .12em; }
 .fortune-game-id code { min-width: 0; color: #E9EDF4; font: 700 15px/1.3 'DM Sans', sans-serif; overflow-wrap: anywhere; }
-.fortune-transaction code { min-width: 0; color: #E9EDF4; font: 500 9px/1.4 ui-monospace, SFMono-Regular, Consolas, monospace; overflow-wrap: anywhere; }
 .fortune-game-id button { display: grid; place-items: center; flex: 0 0 20px; width: 20px; height: 20px; padding: 0; border: 0; border-radius: 0; background: transparent; color: #E9EDF4; cursor: pointer; }
-.fortune-transaction { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; padding: 9px; border: 1px solid rgba(233,237,244,.15); border-radius: 10px; background: rgba(20,26,39,.34); text-align: left; }
-.fortune-transaction a { display: flex; align-items: center; justify-content: center; gap: 6px; min-height: 32px; margin-top: 2px; color: #E9EDF4; font-size: 11px; text-decoration: none; }
+.fortune-tx-link { display: inline-flex; align-items: center; flex: 0 0 auto; gap: 3px; color: #D6BE8B; font: 700 9px/1 'DM Sans', sans-serif; text-decoration: none; white-space: nowrap; }
+.fortune-tx-link:hover { color: #F2DFB4; }
 .fortune-btn { width: 100%; border: 0; border-radius: 13px; padding: 14px 20px; margin-top: 14px; font: 600 15px 'DM Sans', sans-serif; letter-spacing: .03em; cursor: pointer; }
 .fortune-btn-outline { margin-top: 18px; border: 1.5px solid rgba(233,237,244,.35); background: transparent; color: #E9EDF4; }
 .fortune-btn-outline:active { background: rgba(233,237,244,.08); }
@@ -1173,7 +1171,7 @@ body {
 }
 @keyframes fortune-win-label-in { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
 @keyframes fortune-win-button-in { from { opacity: 0; transform: translateY(7px); } to { opacity: 1; transform: translateY(0); } }
-.fortune-game-id button:focus-visible, .fortune-transaction a:focus-visible, .fortune-btn:focus-visible { outline: 2px solid #F2DFB4; outline-offset: 3px; }
+.fortune-game-id button:focus-visible, .fortune-tx-link:focus-visible, .fortune-btn:focus-visible { outline: 2px solid #F2DFB4; outline-offset: 3px; }
 @keyframes linqa-result-fade-in { from { opacity: 0; } to { opacity: 1; } }
 @keyframes linqa-result-card-in { from { opacity: 0; transform: translateY(14px) scale(.86); } to { opacity: 1; transform: translateY(0) scale(1); } }
 @keyframes linqa-result-mark-in { from { opacity: 0; transform: scale(.35) rotate(-30deg); } to { opacity: 1; transform: scale(1) rotate(0); } }

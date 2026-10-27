@@ -187,7 +187,9 @@ async function saveVerifiedRound(txHash: Hex) {
   } else {
     throw new Error('Transaction does not contain a completed Linqa round')
   }
-  if (transaction.from.toLowerCase() !== player.toLowerCase()) throw new Error('Transaction sender does not match the round player')
+  // V4 gameplay actions are submitted by the configured relayer. The contract
+  // verifies the player's signed session action and emits the player in its
+  // completion events, so transaction.from is expected to be the relayer.
 
   const storedRound = await client.readContract({
     address: CONTRACT_ADDRESS,

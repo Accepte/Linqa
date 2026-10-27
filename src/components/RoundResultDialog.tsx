@@ -193,17 +193,16 @@ export default function RoundResultDialog({ outcome, onClose }: RoundResultDialo
           )}
 
           {!won && <img className="fortune-loss-illustration" src={lossIllustration} alt="" aria-hidden="true" />}
-          {outcome.txHash ? (
-            <div className="fortune-transaction">
-              <span>TRANSACTION HASH</span>
-              <code title={outcome.txHash}>{outcome.txHash}</code>
-              <a href={buildTxExplorerUrl(outcome.chainId, outcome.txHash)} target="_blank" rel="noopener noreferrer"><ExternalLink size={14} /> View transaction</a>
-            </div>
-          ) : null}
           <div className="fortune-game-id">
             <span>GAME ID:</span>
             <code title={outcome.gameId}>{outcome.gameId}</code>
             <button type="button" onClick={() => void copyGameId()} aria-label="Copy Game ID" title="Copy Game ID"><Copy size={14} /></button>
+            {won && outcome.txHash && (
+              <a className="fortune-tx-link" href={buildTxExplorerUrl(outcome.chainId, outcome.txHash)} target="_blank" rel="noopener noreferrer" aria-label="View winning transaction" title="View transaction">
+                <span>TRANSACTION</span>
+                <ExternalLink size={12} aria-hidden="true" />
+              </a>
+            )}
           </div>
 
           <div className="fortune-confirm-slot">

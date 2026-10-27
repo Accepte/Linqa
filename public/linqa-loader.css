@@ -101,3 +101,6 @@
   .linqa-brand-loader__text span,
   .linqa-brand-loader__line::after { animation: none; }
 }
+@media (max-width: 600px) {
+  .linqa-brand-loader { font-size: clamp(32px, 12vw, 76px); }
+}

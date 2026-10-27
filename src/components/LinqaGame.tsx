@@ -422,6 +422,7 @@ export default function LinqaGame() {
   const secretsRef = useRef<`0x${string}`[]>([])
   const currentRoundIdRef = useRef<bigint>(0n)
   const autoAdvanceRef = useRef(false)
+  const startingRequestRef = useRef(false)
   const pendingStartStakeRef = useRef<bigint | null>(null)
   const relaySessionRef = useRef<ReturnType<typeof privateKeyToAccount> | null>(null)
   const relayedActionRef = useRef(false)
@@ -580,6 +581,7 @@ export default function LinqaGame() {
 
   const startApprovedRound = useCallback((stakeAmount: bigint) => {
     if (!address) {
+      startingRequestRef.current = false
       setTxPhase('idle')
       setErrorMsg('Reconnect your wallet to start the game.')
       return
@@ -589,6 +591,7 @@ export default function LinqaGame() {
       session = createRelaySession(address, targetChainId)
       relaySessionRef.current = session
     } catch {
+      startingRequestRef.current = false
       setTxPhase('idle')
       setErrorMsg('Could not prepare the private gameplay session on this device.')
       return
@@ -616,6 +619,7 @@ export default function LinqaGame() {
         chainId: targetChainId,
       })
     } catch {
+      startingRequestRef.current = false
       setTxPhase('idle')
       setHasCurrentSecret(false)
       secretsRef.current = []
@@ -669,21 +673,25 @@ export default function LinqaGame() {
       pendingStartStakeRef.current = null
       void refetchAllowance().then(({ data }) => {
         if (approvedStake === null) {
+          startingRequestRef.current = false
           setTxPhase('idle')
           return
         }
         if ((data ?? 0n) < approvedStake) {
+          startingRequestRef.current = false
           setTxPhase('idle')
           setErrorMsg('USDC approval confirmed. Tap Start Game again to retry.')
           return
         }
         window.setTimeout(() => startApprovedRound(approvedStake), 0)
       }).catch(() => {
+        startingRequestRef.current = false
         setTxPhase('idle')
         if (approvedStake !== null) setErrorMsg('USDC approval confirmed. Tap Start Game again to retry.')
       })
       toast.success('Approval confirmed')
     } else if (txPhase === 'starting') {
+      startingRequestRef.current = false
       setTxPhase('idle')
       setRoundPhase('active')
       const started = parseEventLogs({ abi: LINQA_ABI, logs: receipt.logs, eventName: 'RoundStarted', strict: true })
@@ -816,6 +824,7 @@ export default function LinqaGame() {
 
   useEffect(() => {
     if (isWriteError) {
+      startingRequestRef.current = false
       pendingStartStakeRef.current = null
       if (txPhase === 'starting') {
         secretsRef.current = []
@@ -826,12 +835,14 @@ export default function LinqaGame() {
       setTxPhase('idle')
       setPendingTileIndex(null)
       setErrorMsg((writeError as { shortMessage?: string } | null)?.shortMessage ?? 'Wallet request was cancelled or could not be submitted.')
+      setRelayTxHash(undefined)
       resetWrite()
     }
   }, [isWriteError, writeError, resetWrite, txPhase, address, targetChainId])
 
   useEffect(() => {
     if (isTxError) {
+      startingRequestRef.current = false
       pendingStartStakeRef.current = null
       if (txPhase === 'starting') {
         secretsRef.current = []
@@ -948,18 +959,23 @@ export default function LinqaGame() {
   }, [address, publicClient, deployedGameVersion, targetChainId, resetWrite])
 
   const handleStartGame = useCallback(async () => {
+    if (startingRequestRef.current) return
+    startingRequestRef.current = true
     if (LOCAL_DEMO_MODE) {
       setErrorMsg(null)
       const stakeRaw = parseAmount(targetChainId, stakeInput)
       if (!stakeRaw) {
+        startingRequestRef.current = false
         setErrorMsg('Enter a valid stake amount.')
         return
       }
       if (stakeRaw.raw < MIN_STAKE_RAW) {
+        startingRequestRef.current = false
         setErrorMsg('Minimum stake is $0.50 USDC.')
         return
       }
       if (stakeRaw.raw > MAX_STAKE_RAW) {
+        startingRequestRef.current = false
         setErrorMsg('Maximum stake is $10,000 USDC.')
         return
       }
@@ -974,23 +990,37 @@ export default function LinqaGame() {
       setPendingTileIndex(null)
       setHasCurrentSecret(true)
       window.setTimeout(() => {
+        startingRequestRef.current = false
         setTxPhase('idle')
         setRoundPhase('active')
       }, 250)
       return
     }
-    if (!address || !usdcAddress) return
+    if (!address || !usdcAddress) {
+      startingRequestRef.current = false
+      return
+    }
     setErrorMsg(null)
-    if (!await ensureChain()) return
 
     const stakeRaw = parseAmount(targetChainId, stakeInput)
-    if (!stakeRaw) { setErrorMsg('Invalid stake amount'); return }
+    if (!stakeRaw) { startingRequestRef.current = false; setErrorMsg('Invalid stake amount'); return }
     if (stakeRaw.raw < MIN_STAKE_RAW) {
+      startingRequestRef.current = false
       setErrorMsg('Minimum stake is $0.50 USDC.')
       return
     }
     if (stakeRaw.raw > MAX_STAKE_RAW) {
+      startingRequestRef.current = false
       setErrorMsg('Maximum stake is $10,000 USDC.')
+      return
+    }
+
+    // Lock the start action during chain switching and relay readiness checks,
+    // not only after the wallet transaction prompt appears.
+    setTxPhase('starting')
+    if (!await ensureChain()) {
+      startingRequestRef.current = false
+      setTxPhase('idle')
       return
     }
 
@@ -999,10 +1029,14 @@ export default function LinqaGame() {
         const response = await fetch('/api/relay', { method: 'GET', cache: 'no-store' })
         const status = await response.json() as { ready?: boolean }
         if (!response.ok || status.ready !== true) {
+          startingRequestRef.current = false
+          setTxPhase('idle')
           setErrorMsg('Sponsored gameplay is temporarily unavailable. Please try again later.')
           return
         }
       } catch {
+        startingRequestRef.current = false
+        setTxPhase('idle')
         setErrorMsg('Sponsored gameplay is temporarily unavailable. Please try again later.')
         return
       }
@@ -1024,6 +1058,7 @@ export default function LinqaGame() {
           chainId: targetChainId,
         })
       } catch {
+        startingRequestRef.current = false
         pendingStartStakeRef.current = null
         setTxPhase('idle')
         setErrorMsg('Approval failed')
@@ -1217,6 +1252,10 @@ export default function LinqaGame() {
   }, [address, roundPhase, currentRowIndex, txPhase, ensureChain, currentMultiplierWAD, stakeInput, writeContract, targetChainId, currentGameId, addDemoToHistory, deployedGameVersion, sendRelayedAction])
 
   const handleReset = useCallback(() => {
+    startingRequestRef.current = false
+    relayedActionRef.current = false
+    pendingStartStakeRef.current = null
+    setRelayTxHash(undefined)
     if (LOCAL_DEMO_MODE) setDemoRowPattern(createDemoRowPattern())
     setRoundPhase('idle')
     setTxPhase('idle')
@@ -1433,8 +1472,6 @@ export default function LinqaGame() {
     }
   } else if (LOCAL_DEMO_MODE) {
     actionStatus = 'LOCAL DEMO · NO WALLET OR CONTRACT REQUIRED'
-  } else if (isBusy || roundPhase === 'result_pending') {
-    actionStatus = getButtonLabel()
   }
 
   function renderActionStatus() {
@@ -1566,7 +1603,9 @@ export default function LinqaGame() {
       <div className="linqa-fit-content">
       {/* ── Main content ── */}
       <main className={`linqa-main${isRoundActive ? ' linqa-main--playing' : ''}`}>
-        <NoticeBar notice={activeNotice} durationMs={activeNoticeDuration} paused={noticePaused} onPauseChange={setNoticePaused} />
+        {isPlaying
+          ? <div className="linqa-notice-slot" aria-hidden="true" />
+          : <NoticeBar notice={activeNotice} durationMs={activeNoticeDuration} paused={noticePaused} onPauseChange={setNoticePaused} />}
 
         <div className="linqa-play-panel">
         {/* Game board */}
@@ -1637,8 +1676,8 @@ export default function LinqaGame() {
                 {({ show }) => (
                   <>
                     <LinqaActionButton
-                      label={LOCAL_DEMO_MODE ? getButtonLabel() : isConnected ? 'START GAME' : 'CONNECT WALLET'}
-                      hoverLabel={LOCAL_DEMO_MODE ? "Let's play" : isConnected ? "Let's play" : 'CONNECT WALLET'}
+                      label={LOCAL_DEMO_MODE ? getButtonLabel() : isConnected ? getButtonLabel() : 'CONNECT WALLET'}
+                      hoverLabel={isBusy ? getButtonLabel() : LOCAL_DEMO_MODE ? "Let's play" : isConnected ? "Let's play" : 'CONNECT WALLET'}
                       variant="standard"
                       onClick={LOCAL_DEMO_MODE || isConnected ? handleMainButton : show}
                       disabled={LOCAL_DEMO_MODE ? isBusy : isConnected && (isBusy || !contractDeployed || (!contractCompatible && !hasExistingRound))}
@@ -1702,8 +1741,8 @@ export default function LinqaGame() {
                 return (
                   <>
                     <LinqaActionButton
-                      label={LOCAL_DEMO_MODE ? getButtonLabel() : !isConnected ? 'CONNECT WALLET' : isRoundActive ? getButtonLabel() : 'START GAME'}
-                      hoverLabel={isRoundActive && !canCashOut ? 'OPEN TILES' : LOCAL_DEMO_MODE ? (showCashout || isBusy ? getButtonLabel() : "Let's play") : isConnected ? "Let's play" : 'CONNECT WALLET'}
+                      label={LOCAL_DEMO_MODE ? getButtonLabel() : !isConnected ? 'CONNECT WALLET' : getButtonLabel()}
+                      hoverLabel={isBusy ? getButtonLabel() : isRoundActive && !canCashOut ? 'OPEN TILES' : LOCAL_DEMO_MODE ? (showCashout ? getButtonLabel() : "Let's play") : isConnected ? "Let's play" : 'CONNECT WALLET'}
                       variant={showCashout ? 'cashout' : 'standard'}
                       onClick={LOCAL_DEMO_MODE || isConnected ? handleMainButton : show}
                       disabled={LOCAL_DEMO_MODE ? isBusy || (roundPhase === 'active' && !canCashOut) : isConnected && !roundFinished && (isBusy || roundPhase === 'result_pending' || (roundPhase === 'active' && !canCashOut) || !contractDeployed || (!contractCompatible && !hasExistingRound))}
