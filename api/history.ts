@@ -155,25 +155,34 @@ async function saveVerifiedRound(txHash: Hex) {
 
   let roundId: bigint
   let player: Address
-  let stake: bigint
+  let stake = 0n
   let payout: bigint
   let multiplierWad: bigint
   let won: boolean
   if (cashedOut) {
-    roundId = cashedOut.args.roundId
-    player = cashedOut.args.player
-    payout = cashedOut.args.payout
-    multiplierWad = cashedOut.args.multiplierWAD
+    const { roundId: eventRoundId, player: eventPlayer, payout: eventPayout, multiplierWAD: eventMultiplier } = cashedOut.args
+    if (eventRoundId === undefined || !eventPlayer || eventPayout === undefined || eventMultiplier === undefined) {
+      throw new Error('Cashout event is missing round details')
+    }
+    roundId = eventRoundId
+    player = eventPlayer
+    payout = eventPayout
+    multiplierWad = eventMultiplier
     won = true
   } else if (lost) {
-    roundId = lost.args.roundId
-    player = lost.args.player
-    stake = lost.args.stake
+    const { roundId: eventRoundId, player: eventPlayer, stake: eventStake } = lost.args
+    if (eventRoundId === undefined || !eventPlayer || eventStake === undefined) {
+      throw new Error('Loss event is missing round details')
+    }
+    roundId = eventRoundId
+    player = eventPlayer
+    stake = eventStake
     payout = 0n
     won = false
     const selected = parseEventLogs({ abi: ROUND_ABI, logs: gameLogs, eventName: 'TileSelected', strict: false })
-      .find(event => event.args.roundId === roundId && event.args.player.toLowerCase() === player.toLowerCase() && !event.args.safe)
+      .find(event => event.args.roundId === roundId && event.args.player?.toLowerCase() === player.toLowerCase() && event.args.safe === false)
     if (!selected) throw new Error('Loss could not be verified from its contract events')
+    if (selected.args.newMultiplierWAD === undefined) throw new Error('Loss event is missing its multiplier')
     multiplierWad = selected.args.newMultiplierWAD
   } else {
     throw new Error('Transaction does not contain a completed Linqa round')
@@ -185,12 +194,12 @@ async function saveVerifiedRound(txHash: Hex) {
     abi: ROUND_ABI,
     functionName: 'getRound',
     args: [roundId],
-  }) as readonly [bigint, Address, bigint, bigint, bigint, number]
-  if (storedRound[1].toLowerCase() !== player.toLowerCase() || storedRound[2] <= 0n) throw new Error('Contract round state does not match its result event')
-  if ((won && storedRound[5] !== 2) || (!won && storedRound[5] !== 3)) throw new Error('Contract round is not in a completed state')
-  if (!won && storedRound[2] !== stake) throw new Error('Contract stake does not match its loss event')
-  stake = storedRound[2]
-  if (storedRound[4] !== multiplierWad) throw new Error('Contract multiplier does not match its result event')
+  })
+  if (storedRound.player.toLowerCase() !== player.toLowerCase() || storedRound.stake <= 0n) throw new Error('Contract round state does not match its result event')
+  if ((won && storedRound.status !== 2) || (!won && storedRound.status !== 3)) throw new Error('Contract round is not in a completed state')
+  if (!won && storedRound.stake !== stake) throw new Error('Contract stake does not match its loss event')
+  stake = storedRound.stake
+  if (storedRound.multiplierWAD !== multiplierWad) throw new Error('Contract multiplier does not match its result event')
   const minedBlock = await client.getBlock({ blockNumber: receipt.blockNumber })
   const playedAt = new Date(Number(minedBlock.timestamp) * 1_000).toISOString()
 
