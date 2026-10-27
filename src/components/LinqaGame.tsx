@@ -11,7 +11,9 @@ import { parseAmount, usdcDecimalsFor, Amount } from '@/onchain-money'
 import LinqaBoard, { CONTRACT_ROW_PATTERN, createDemoRowPattern, DEMO_MAX_MULTIPLIER_WAD } from './LinqaBoard'
 import HistoryPanel from './HistoryPanel'
 import HowToPlayPanel from './HowToPlayPanel'
+import LinqaLoader from './LinqaLoader'
 import RoundResultDialog, { type RoundOutcome } from './RoundResultDialog'
+import NoticeBar, { type NoticeBarItem } from './NoticeBar'
 import type { GameRound } from './linqa-types'
 
 // ─── Contract ────────────────────────────────────────────────────────────────
@@ -259,6 +261,12 @@ async function persistConfirmedRound(txHash: `0x${string}`): Promise<void> {
 // ─── Game state types ─────────────────────────────────────────────────────────
 type TxPhase = 'idle' | 'approving' | 'starting' | 'selecting' | 'advancing' | 'cashingout'
 type RoundPhase = 'idle' | 'active' | 'result_pending' | 'collectable' | 'won' | 'lost'
+interface LiveAnnouncement {
+  id: number | string
+  kind: 'info' | 'promo' | 'warning'
+  message: string
+  linkUrl?: string | null
+}
 
 interface RowReveal {
   rowIndex: number
@@ -294,7 +302,7 @@ function LinqaActionButton({ label, hoverLabel, variant, onClick, disabled }: Li
   )
 }
 export default function LinqaGame() {
-  const { address, isConnected, chainId: walletChainId } = useAccount()
+  const { address, isConnected, isReconnecting, chainId: walletChainId } = useAccount()
   const { switchChain, switchChainAsync } = useSwitchChain()
 
   const targetChainId = arcTestnet.id
@@ -313,8 +321,16 @@ export default function LinqaGame() {
   const [currentGameId, setCurrentGameId] = useState<string | null>(null)
   const [showHistory, setShowHistory] = useState(false)
   const [showHowToPlay, setShowHowToPlay] = useState(false)
+  const [showMainnetSoon, setShowMainnetSoon] = useState(false)
+  const [showInitialLoader, setShowInitialLoader] = useState(true)
+  const [showRoundSyncLoader, setShowRoundSyncLoader] = useState(false)
+  const roundSyncStartedAt = useRef<number | null>(null)
   const [historyRounds, setHistoryRounds] = useState<GameRound[]>(readHistory)
   const [activityRounds, setActivityRounds] = useState<GameRound[]>([])
+  const [announcements, setAnnouncements] = useState<LiveAnnouncement[]>([])
+  const [noticeIndex, setNoticeIndex] = useState(0)
+  const [noticePaused, setNoticePaused] = useState(false)
+  const noticeClock = useRef({ id: '', remaining: 0, startedAt: 0 })
   const [hasCurrentSecret, setHasCurrentSecret] = useState(false)
   const [pendingTileIndex, setPendingTileIndex] = useState<number | null>(null)
   const [errorMsg, setErrorMsg] = useState<string | null>(null)
@@ -376,6 +392,29 @@ export default function LinqaGame() {
       disposed = true
       window.clearInterval(interval)
       window.removeEventListener('linqa-round-saved', refresh)
+    }
+  }, [])
+
+  // Pull currently scheduled promos and info from the announcement API. The
+  // top notice rotates these alongside verified, shared round outcomes.
+  useEffect(() => {
+    if (LOCAL_DEMO_MODE) return
+    let disposed = false
+    const refreshAnnouncements = async () => {
+      try {
+        const response = await fetch('/api/announcements')
+        if (!response.ok) return
+        const body = await response.json() as { announcements?: LiveAnnouncement[] }
+        if (!disposed) setAnnouncements(Array.isArray(body.announcements) ? body.announcements : [])
+      } catch {
+        // Keep the last successful announcements while offline.
+      }
+    }
+    void refreshAnnouncements()
+    const interval = window.setInterval(refreshAnnouncements, 60_000)
+    return () => {
+      disposed = true
+      window.clearInterval(interval)
     }
   }, [])
 
@@ -472,7 +511,7 @@ export default function LinqaGame() {
   const usdcAddress = usdc?.address as Address | undefined
 
   // ── Contract reads ──────────────────────────────────────────────────────────
-  const { data: activeRoundData, refetch: refetchRound } = useReadContract({
+  const { data: activeRoundData, refetch: refetchRound, isLoading: isCheckingActiveRound } = useReadContract({
     address: CONTRACT_ADDRESS,
     abi: LINQA_ABI,
     functionName: 'getActiveRound',
@@ -488,6 +527,31 @@ export default function LinqaGame() {
     chainId: targetChainId,
     query: { enabled: !LOCAL_DEMO_MODE && CONTRACT_ADDRESS !== '0x0000000000000000000000000000000000000000' },
   })
+
+  // Show the branded loader only while the app's first critical sync runs.
+  // Later transaction and payout states keep their existing wallet/status UI.
+  const initialSyncStartedAt = useRef(Date.now())
+  useEffect(() => {
+    if (!showInitialLoader) return
+    const hasConfiguredContract = !LOCAL_DEMO_MODE && CONTRACT_ADDRESS !== '0x0000000000000000000000000000000000000000'
+    const isInitialSyncPending = isReconnecting
+      || (hasConfiguredContract && isCheckingGameVersion)
+      || (!!address && hasConfiguredContract && isCheckingActiveRound)
+    if (isInitialSyncPending) return
+
+    const remainingMinimumTime = Math.max(0, 3000 - (Date.now() - initialSyncStartedAt.current))
+    const timer = window.setTimeout(() => setShowInitialLoader(false), remainingMinimumTime)
+    return () => window.clearTimeout(timer)
+  }, [address, isCheckingActiveRound, isCheckingGameVersion, isReconnecting, showInitialLoader])
+
+  useEffect(() => {
+    const failsafe = window.setTimeout(() => setShowInitialLoader(false), 7000)
+    return () => window.clearTimeout(failsafe)
+  }, [])
+
+  useEffect(() => {
+    document.getElementById('linqa-preboot')?.remove()
+  }, [])
 
   const { data: usdcBalance, refetch: refetchBalance } = useReadContract({
     address: usdcAddress,
@@ -1181,6 +1245,30 @@ export default function LinqaGame() {
   const isRoundActive = roundPhase === 'active' || roundPhase === 'result_pending' || roundPhase === 'collectable'
   const canCashOut = roundPhase === 'collectable' || (roundPhase === 'active' && currentRowIndex > 0)
   const isBusy = txPhase !== 'idle' || isWritePending || isTxConfirming
+  const isRestoringActiveRound = !!address && isCheckingActiveRound && !isBusy && !resultOutcome
+  useEffect(() => {
+    if (showInitialLoader) return
+    if (isRestoringActiveRound) {
+      if (roundSyncStartedAt.current === null) {
+        roundSyncStartedAt.current = Date.now()
+        setShowRoundSyncLoader(true)
+      }
+      return
+    }
+    if (isBusy || resultOutcome) {
+      roundSyncStartedAt.current = null
+      setShowRoundSyncLoader(false)
+      return
+    }
+    if (roundSyncStartedAt.current === null) return
+
+    const remainingMinimumTime = Math.max(0, 3000 - (Date.now() - roundSyncStartedAt.current))
+    const timer = window.setTimeout(() => {
+      roundSyncStartedAt.current = null
+      setShowRoundSyncLoader(false)
+    }, remainingMinimumTime)
+    return () => window.clearTimeout(timer)
+  }, [isBusy, isRestoringActiveRound, resultOutcome, showInitialLoader])
   const isPlaying = isRoundActive || isBusy || resultOutcome !== null
   const displayMultiplier = formatMultiplier(currentMultiplierWAD)
   const cashoutAmount = (() => {
@@ -1235,7 +1323,93 @@ export default function LinqaGame() {
     return 'START GAME'
   }
 
-  const topNotice = 'TESTNET SIMULATION · PICK A TILE · BUILD YOUR MULTIPLIER'
+  const outcomeNotices: NoticeBarItem[] = activityRounds.slice(0, 5).map(round => {
+    const isMine = !!address && round.playerAddress?.toLowerCase() === address.toLowerCase()
+    const player = isMine
+      ? 'You'
+      : round.playerAddress
+        ? `${round.playerAddress.slice(0, 5)}…${round.playerAddress.slice(-3)}`
+        : 'A player'
+    const won = round.won
+    const amount = won ? round.payout : round.stake
+    return {
+      id: `round-${round.roundId}`,
+      tone: won ? 'win' : 'loss',
+      player,
+      message: won ? 'won' : 'lost',
+      amount: `$${amount} USDC`,
+      subtitle: won ? 'Congratulations' : 'uhhh try again',
+    }
+  })
+  const announcementNotices: NoticeBarItem[] = announcements.slice(0, 3).map(announcement => ({
+    id: `announcement-${announcement.id}`,
+    tone: announcement.kind,
+    message: announcement.message,
+    linkUrl: announcement.linkUrl,
+    linkLabel: announcement.linkUrl ? 'Open' : undefined,
+  }))
+  const hasLiveFeed = outcomeNotices.length > 0 || announcementNotices.length > 0
+  const xPromo: NoticeBarItem = {
+    id: 'linqa-x-updates',
+    tone: 'promo',
+    message: 'Follow @linqagame on X for updates',
+    linkUrl: 'https://x.com/linqagame',
+    linkLabel: 'Follow',
+  }
+  const evergreenNotices: NoticeBarItem[] = [
+    ...(!hasLiveFeed ? [xPromo] : []),
+    {
+      id: 'linqa-info-risk-build',
+      tone: 'info',
+      message: 'take risk · build your multiplier up to 9,410X',
+    },
+    {
+      id: 'linqa-info-pick-tile',
+      tone: 'info',
+      message: 'Pick a tile · build your multiplier · get rewarding',
+    },
+    ...(!hasLiveFeed ? [{ ...xPromo, id: 'linqa-x-updates-repeat' }] : []),
+    {
+      id: 'linqa-info-multiplier-risk',
+      tone: 'info',
+      message: 'Higher multipliers carry high wiining · risk is needed',
+    },
+  ]
+  const noticeFeed: NoticeBarItem[] = []
+  for (let index = 0; index < Math.max(outcomeNotices.length, announcementNotices.length, evergreenNotices.length); index += 1) {
+    if (outcomeNotices[index]) noticeFeed.push(outcomeNotices[index])
+    if (announcementNotices[index]) noticeFeed.push(announcementNotices[index])
+    if (evergreenNotices[index]) noticeFeed.push(evergreenNotices[index])
+  }
+  const activeNotice = noticeFeed[noticeIndex % noticeFeed.length]
+  const activeNoticeDuration = activeNotice.tone === 'warning' ? 6_000 : 4_400
+
+  useEffect(() => {
+    setNoticeIndex(index => index % noticeFeed.length)
+  }, [noticeFeed.length])
+
+  useEffect(() => {
+    if (noticeFeed.length < 2 || noticePaused) return
+    const clock = noticeClock.current
+    if (clock.id !== activeNotice.id) {
+      clock.id = activeNotice.id
+      clock.remaining = activeNoticeDuration
+    }
+    clock.startedAt = Date.now()
+    const timeout = window.setTimeout(() => {
+      clock.remaining = 0
+      clock.startedAt = 0
+      setNoticeIndex(index => (index + 1) % noticeFeed.length)
+    }, clock.remaining)
+    return () => {
+      window.clearTimeout(timeout)
+      if (clock.startedAt) {
+        clock.remaining = Math.max(0, clock.remaining - (Date.now() - clock.startedAt))
+        clock.startedAt = 0
+      }
+    }
+  }, [activeNotice.id, activeNoticeDuration, noticeFeed.length, noticePaused])
+
   let actionStatus = ''
   let actionStatusTone = ''
   if (errorMsg) {
@@ -1307,6 +1481,7 @@ export default function LinqaGame() {
 
   return (
     <div className="linqa-root">
+      {(showInitialLoader || showRoundSyncLoader) && <LinqaLoader />}
       {/* ── Header ── */}
       <header className="linqa-header">
         <img className="linqa-logo" src="/linqa-logo.svg" alt="Linqa" />
@@ -1391,9 +1566,7 @@ export default function LinqaGame() {
       <div className="linqa-fit-content">
       {/* ── Main content ── */}
       <main className={`linqa-main${isRoundActive ? ' linqa-main--playing' : ''}`}>
-        <div className="linqa-notice" aria-live="polite" aria-atomic="true">
-          <span className="linqa-notice__text">{topNotice}</span>
-        </div>
+        <NoticeBar notice={activeNotice} durationMs={activeNoticeDuration} paused={noticePaused} onPauseChange={setNoticePaused} />
 
         <div className="linqa-play-panel">
         {/* Game board */}
@@ -1548,13 +1721,21 @@ export default function LinqaGame() {
 
       {/* ── Network selector ── */}
       <footer className="linqa-footer">
+        <div
+          id="linqa-mainnet-note"
+          className={`linqa-mainnet-note${showMainnetSoon && !isPlaying ? '' : ' linqa-mainnet-note--hidden'}`}
+          aria-live="polite"
+        >
+          Mainnet soon
+        </div>
         <div className={`linqa-net-selector${isPlaying ? ' linqa-net-selector--hidden' : ''}`}>
           <button
             className="linqa-net-btn linqa-net-btn--disabled"
             type="button"
-            disabled
-            title="Mainnet is disabled for now"
-            aria-label="Mainnet disabled for now"
+            onClick={() => setShowMainnetSoon(true)}
+            title="Mainnet soon"
+            aria-label="Mainnet soon"
+            aria-describedby="linqa-mainnet-note"
           >
             MAINNET
           </button>
