@@ -183,6 +183,24 @@ function readHistory(): GameRound[] {
   }
 }
 
+async function persistConfirmedRound(txHash: `0x${string}`): Promise<void> {
+  try {
+    const response = await fetch('/api/history', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ txHash }),
+    })
+    if (!response.ok) {
+      const body = await response.json().catch(() => null) as { error?: string } | null
+      console.warn('Could not save confirmed round to shared history:', body?.error ?? response.status)
+    } else {
+      window.dispatchEvent(new Event('linqa-round-saved'))
+    }
+  } catch (error) {
+    console.warn('Could not reach shared history service:', error)
+  }
+}
+
 // ─── Game state types ─────────────────────────────────────────────────────────
 type TxPhase = 'idle' | 'approving' | 'starting' | 'selecting' | 'advancing' | 'cashingout'
 type RoundPhase = 'idle' | 'active' | 'result_pending' | 'collectable' | 'won' | 'lost'
@@ -222,7 +240,7 @@ function LinqaActionButton({ label, hoverLabel, variant, onClick, disabled }: Li
 }
 export default function LinqaGame() {
   const { address, isConnected, chainId: walletChainId } = useAccount()
-  const { switchChain } = useSwitchChain()
+  const { switchChain, switchChainAsync } = useSwitchChain()
 
   const targetChainId = arcTestnet.id
 
@@ -240,14 +258,75 @@ export default function LinqaGame() {
   const [showHistory, setShowHistory] = useState(false)
   const [showHowToPlay, setShowHowToPlay] = useState(false)
   const [historyRounds, setHistoryRounds] = useState<GameRound[]>(readHistory)
+  const [activityRounds, setActivityRounds] = useState<GameRound[]>([])
   const [hasCurrentSecret, setHasCurrentSecret] = useState(false)
   const [pendingTileIndex, setPendingTileIndex] = useState<number | null>(null)
   const [errorMsg, setErrorMsg] = useState<string | null>(null)
+
+  // Load 90-day history from Neon for the connected wallet. Older local entries
+  // are submitted by transaction hash only; the server rechecks each receipt
+  // and contract state before migrating it.
+  useEffect(() => {
+    if (!address || walletChainId !== targetChainId || LOCAL_DEMO_MODE) return
+    const controller = new AbortController()
+    setHistoryRounds([])
+    const syncHistory = async () => {
+      const legacyHashes = [...new Set(readHistory()
+        .filter(round => round.chainId === targetChainId && round.txHash)
+        .map(round => round.txHash as `0x${string}`))].slice(0, 20)
+      for (let index = 0; index < legacyHashes.length; index += 4) {
+        await Promise.all(legacyHashes.slice(index, index + 4).map(txHash =>
+          fetch('/api/history', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ txHash }),
+            signal: controller.signal,
+          }).catch(() => undefined),
+        ))
+      }
+
+      const response = await fetch(`/api/history?wallet=${encodeURIComponent(address)}&limit=2000`, { signal: controller.signal })
+      if (!response.ok) throw new Error(`History service returned ${response.status}`)
+      const body = await response.json() as { rounds?: GameRound[] }
+      if (!controller.signal.aborted) setHistoryRounds(Array.isArray(body.rounds) ? body.rounds : [])
+    }
+    void syncHistory().catch(error => {
+      if (!controller.signal.aborted) console.warn('Could not load shared round history:', error)
+    })
+    return () => controller.abort()
+  }, [address, walletChainId, targetChainId])
+
+  // Keep the existing recent-activity panel shared across players, refreshing
+  // periodically and immediately after this browser records a mined round.
+  useEffect(() => {
+    if (LOCAL_DEMO_MODE) return
+    let disposed = false
+    const refreshActivity = async () => {
+      try {
+        const response = await fetch('/api/history?scope=recent&limit=5')
+        if (!response.ok) return
+        const body = await response.json() as { rounds?: GameRound[] }
+        if (!disposed) setActivityRounds(Array.isArray(body.rounds) ? body.rounds : [])
+      } catch {
+        // Preserve the last successful feed (or local history) while offline.
+      }
+    }
+    const refresh = () => { void refreshActivity() }
+    refresh()
+    const interval = window.setInterval(refresh, 30_000)
+    window.addEventListener('linqa-round-saved', refresh)
+    return () => {
+      disposed = true
+      window.clearInterval(interval)
+      window.removeEventListener('linqa-round-saved', refresh)
+    }
+  }, [])
 
   // Secrets per row
   const secretsRef = useRef<`0x${string}`[]>([])
   const currentRoundIdRef = useRef<bigint>(0n)
   const autoAdvanceRef = useRef(false)
+  const pendingStartStakeRef = useRef<bigint | null>(null)
 
   useEffect(() => {
     const app = document.querySelector('.linqa-root') as HTMLElement | null
@@ -371,6 +450,43 @@ export default function LinqaGame() {
   const { writeContract, data: writeTxHash, isPending: isWritePending, isError: isWriteError, error: writeError, reset: resetWrite } = useWriteContract()
   const { isLoading: isTxConfirming, isSuccess: isTxSuccess, isError: isTxError, error: txError, data: receipt } = useWaitForTransactionReceipt({ hash: writeTxHash })
 
+  const startApprovedRound = useCallback((stakeAmount: bigint) => {
+    if (!address) {
+      setTxPhase('idle')
+      setErrorMsg('Reconnect your wallet to start the game.')
+      return
+    }
+    secretsRef.current = Array.from({ length: 27 }, () => generateSecret())
+    setHasCurrentSecret(true)
+    saveSecrets(address, targetChainId, secretsRef.current)
+    const commitHash = computeCommitHash(secretsRef.current[0])
+    setCurrentGameId(null)
+    setTxPhase('starting')
+    setReveals([])
+    setCurrentRowIndex(0)
+    setCurrentMultiplierWAD(BASE_MULTIPLIER)
+    setLastResult(null)
+    setResultOutcome(null)
+    setPendingTileIndex(null)
+    autoAdvanceRef.current = false
+
+    try {
+      writeContract({
+        address: CONTRACT_ADDRESS,
+        abi: LINQA_ABI,
+        functionName: 'startRound',
+        args: [stakeAmount, commitHash],
+        chainId: targetChainId,
+      })
+    } catch {
+      setTxPhase('idle')
+      setHasCurrentSecret(false)
+      secretsRef.current = []
+      clearSecrets(address, targetChainId)
+      setErrorMsg('Could not send the start transaction. Please retry.')
+    }
+  }, [address, targetChainId, writeContract])
+
   // ── Sync active round from chain on load ────────────────────────────────────
   useEffect(() => {
     if (!activeRoundData) return
@@ -408,8 +524,23 @@ export default function LinqaGame() {
     const hash = writeTxHash
 
     if (txPhase === 'approving') {
-      setTxPhase('idle')
-      void refetchAllowance()
+      const approvedStake = pendingStartStakeRef.current
+      pendingStartStakeRef.current = null
+      void refetchAllowance().then(({ data }) => {
+        if (approvedStake === null) {
+          setTxPhase('idle')
+          return
+        }
+        if ((data ?? 0n) < approvedStake) {
+          setTxPhase('idle')
+          setErrorMsg('USDC approval confirmed. Tap Start Game again to retry.')
+          return
+        }
+        window.setTimeout(() => startApprovedRound(approvedStake), 0)
+      }).catch(() => {
+        setTxPhase('idle')
+        if (approvedStake !== null) setErrorMsg('USDC approval confirmed. Tap Start Game again to retry.')
+      })
       toast.success('Approval confirmed')
     } else if (txPhase === 'starting') {
       setTxPhase('idle')
@@ -533,6 +664,7 @@ export default function LinqaGame() {
 
   useEffect(() => {
     if (isWriteError) {
+      pendingStartStakeRef.current = null
       if (txPhase === 'starting') {
         secretsRef.current = []
         clearSecrets(address, targetChainId)
@@ -546,6 +678,7 @@ export default function LinqaGame() {
 
   useEffect(() => {
     if (isTxError) {
+      pendingStartStakeRef.current = null
       if (txPhase === 'starting') {
         secretsRef.current = []
         clearSecrets(address, targetChainId)
@@ -570,8 +703,9 @@ export default function LinqaGame() {
       createdAt: Date.now(),
     }
     setHistoryRounds(prev => {
-      return [round, ...prev].slice(0, 20)
+      return [round, ...prev.filter(existing => existing.roundId !== round.roundId)].slice(0, 2_000)
     })
+    if (hash && chainId === arcTestnet.id) void persistConfirmedRound(hash)
   }
 
   const addDemoToHistory = useCallback((gameId: string, won: boolean, multiplier: bigint, payout: bigint, chainId: number) => {
@@ -590,19 +724,22 @@ export default function LinqaGame() {
   }, [stakeInput])
 
   useEffect(() => {
-    try { localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(historyRounds)) } catch { /* History remains available for this session. */ }
+    try { localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(historyRounds.slice(0, 20))) } catch { /* History remains available for this session. */ }
   }, [historyRounds])
 
   // ── Actions ─────────────────────────────────────────────────────────────────
-  const ensureChain = useCallback(() => {
-    if (walletChainId !== targetChainId) {
-      void switchChain({ chainId: targetChainId })
+  const ensureChain = useCallback(async () => {
+    if (walletChainId === targetChainId) return true
+    try {
+      await switchChainAsync({ chainId: targetChainId })
+      return true
+    } catch {
+      setErrorMsg('Switch to Arc Testnet in your wallet to play.')
       return false
     }
-    return true
-  }, [walletChainId, targetChainId, switchChain])
+  }, [walletChainId, targetChainId, switchChainAsync])
 
-  const handleStartGame = useCallback(() => {
+  const handleStartGame = useCallback(async () => {
     if (LOCAL_DEMO_MODE) {
       setErrorMsg(null)
       const stakeRaw = parseAmount(targetChainId, stakeInput)
@@ -635,8 +772,8 @@ export default function LinqaGame() {
       return
     }
     if (!address || !usdcAddress) return
-    if (!ensureChain()) return
     setErrorMsg(null)
+    if (!await ensureChain()) return
 
     const stakeRaw = parseAmount(targetChainId, stakeInput)
     if (!stakeRaw) { setErrorMsg('Invalid stake amount'); return }
@@ -654,6 +791,7 @@ export default function LinqaGame() {
 
     // Approve if needed
     if ((usdcAllowance ?? 0n) < stakeAmount) {
+      pendingStartStakeRef.current = stakeAmount
       setTxPhase('approving')
       try {
         writeContract({
@@ -664,42 +802,17 @@ export default function LinqaGame() {
           chainId: targetChainId,
         })
       } catch {
+        pendingStartStakeRef.current = null
         setTxPhase('idle')
         setErrorMsg('Approval failed')
       }
       return
     }
 
-    // Generate secrets for all rows upfront
-    secretsRef.current = Array.from({ length: 27 }, () => generateSecret())
-    setHasCurrentSecret(true)
-    saveSecrets(address, targetChainId, secretsRef.current)
-    const firstSecret = secretsRef.current[0]
-    const commitHash = computeCommitHash(firstSecret)
+    startApprovedRound(stakeAmount)
+  }, [address, usdcAddress, usdcAllowance, stakeInput, ensureChain, startApprovedRound, writeContract, targetChainId])
 
-    setTxPhase('starting')
-    setReveals([])
-    setCurrentRowIndex(0)
-    setCurrentMultiplierWAD(BASE_MULTIPLIER)
-    setLastResult(null)
-    setResultOutcome(null)
-    autoAdvanceRef.current = false
-
-    try {
-      writeContract({
-        address: CONTRACT_ADDRESS,
-        abi: LINQA_ABI,
-        functionName: 'startRound',
-        args: [stakeAmount, commitHash],
-        chainId: targetChainId,
-      })
-    } catch {
-      setTxPhase('idle')
-      setErrorMsg('Failed to start round')
-    }
-  }, [address, usdcAddress, usdcAllowance, stakeInput, ensureChain, writeContract, targetChainId])
-
-  const handleTileClick = useCallback((tileIndex: number) => {
+  const handleTileClick = useCallback(async (tileIndex: number) => {
     if (LOCAL_DEMO_MODE) {
       if (roundPhase !== 'active' || txPhase !== 'idle') return
       setErrorMsg(null)
@@ -756,7 +869,7 @@ export default function LinqaGame() {
     if (!address) return
     if (roundPhase !== 'active') return
     if (txPhase !== 'idle') return
-    if (!ensureChain()) return
+    if (!await ensureChain()) return
     setErrorMsg(null)
 
     const secret = secretsRef.current[currentRowIndex]
@@ -780,12 +893,12 @@ export default function LinqaGame() {
     }
   }, [address, roundPhase, txPhase, ensureChain, currentRowIndex, currentMultiplierWAD, stakeInput, writeContract, targetChainId, demoRowPattern, currentGameId, addDemoToHistory])
 
-  const handleAdvanceRow = useCallback(() => {
+  const handleAdvanceRow = useCallback(async () => {
     if (LOCAL_DEMO_MODE) return
     if (!address) return
     if (roundPhase !== 'result_pending') return
     if (txPhase !== 'idle') return
-    if (!ensureChain()) return
+    if (!await ensureChain()) return
 
     const nextRowIndex = currentRowIndex + 1
     const nextSecret = secretsRef.current[nextRowIndex] ?? generateSecret()
@@ -818,7 +931,7 @@ export default function LinqaGame() {
     }
   }, [roundPhase, txPhase, handleAdvanceRow])
 
-  const handleCashOut = useCallback(() => {
+  const handleCashOut = useCallback(async () => {
     if (LOCAL_DEMO_MODE) {
       if (roundPhase !== 'active' || currentRowIndex === 0 || txPhase !== 'idle') return
       setErrorMsg(null)
@@ -842,7 +955,7 @@ export default function LinqaGame() {
     if (roundPhase !== 'active' && roundPhase !== 'collectable') return
     if (roundPhase === 'active' && currentRowIndex === 0) return
     if (txPhase !== 'idle') return
-    if (!ensureChain()) return
+    if (!await ensureChain()) return
     setErrorMsg(null)
 
     setTxPhase('cashingout')
@@ -970,11 +1083,15 @@ export default function LinqaGame() {
   }
 
   function renderActionStatus() {
-    if (!actionStatus) return null
     const isWarning = actionStatusTone === 'linqa-action-status--warning'
     return (
-      <div className={`linqa-action-status ${actionStatusTone}`} aria-live="polite" role={actionStatusTone === 'linqa-action-status--error' ? 'status' : undefined}>
-        {isWrongChain && !isPlaying ? (
+      <div
+        className={`linqa-action-status ${actionStatusTone}`}
+        aria-live={actionStatus ? 'polite' : undefined}
+        aria-hidden={!actionStatus}
+        role={actionStatusTone === 'linqa-action-status--error' ? 'status' : undefined}
+      >
+        {actionStatus && (isWrongChain && !isPlaying ? (
           <button className="linqa-action-status__switch" type="button" onClick={() => void switchChain({ chainId: targetChainId })}>
             <CircleAlert className="linqa-action-status__icon" size={16} aria-hidden="true" />
             <span>{actionStatus}</span>
@@ -984,7 +1101,7 @@ export default function LinqaGame() {
             {isWarning && <CircleAlert className="linqa-action-status__icon" size={16} aria-hidden="true" />}
             <span>{actionStatus}</span>
           </span>
-        )}
+        ))}
       </div>
     )
   }
@@ -1041,15 +1158,21 @@ export default function LinqaGame() {
         </div>
       </header>
 
-      {historyRounds.length > 0 && !isRoundActive && !isBusy && !resultOutcome && (
+      {(activityRounds.length > 0 || historyRounds.length > 0) && !isRoundActive && !isBusy && !resultOutcome && (
         <aside className="recent-activity" aria-label="Recent activities">
           <div className="recent-activity__header">
             <h2>Recent Activities</h2>
             <button type="button" onClick={() => setShowHistory(true)}>View all</button>
           </div>
           <ul className="recent-activity__list">
-            {historyRounds.slice(0, 5).map(round => {
+            {(activityRounds.length > 0 ? activityRounds : historyRounds.slice(0, 5)).map(round => {
               const amount = round.won ? round.payout : round.stake
+              const isMine = !!address && round.playerAddress?.toLowerCase() === address.toLowerCase()
+              const playerLabel = isMine
+                ? 'You'
+                : round.playerAddress
+                  ? `${round.playerAddress.slice(0, 5)}…${round.playerAddress.slice(-3)}`
+                  : 'Player'
               const ageSeconds = round.createdAt ? Math.max(0, Math.floor((Date.now() - round.createdAt) / 1000)) : null
               const age = ageSeconds === null
                 ? 'Not found'
@@ -1063,7 +1186,7 @@ export default function LinqaGame() {
               return (
                 <li className={`recent-activity__item${round.won ? ' recent-activity__item--win' : ' recent-activity__item--loss'}`} key={round.roundId}>
                   <time>{age}</time>
-                  <span>{round.won ? 'You won' : 'You lost'}</span>
+                  <span>{playerLabel} {round.won ? 'won' : 'lost'}</span>
                   <strong>${amount} USDC</strong>
                   {round.won ? <PartyPopper size={15} aria-label="Congrats" /> : <Frown size={15} aria-label="Sad" />}
                 </li>

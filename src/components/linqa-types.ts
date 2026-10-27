@@ -9,6 +9,8 @@ export interface GameRound {
   payout: string
   txHash: `0x${string}` | null
   chainId: number
+  /** Public wallet address returned for the shared activity feed. */
+  playerAddress?: `0x${string}`
   /** Local creation time for history display; absent on records saved by older app versions. */
   createdAt?: number
 }

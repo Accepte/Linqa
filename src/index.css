@@ -736,20 +736,26 @@ body {
 }
 .linqa-action-status {
   display: flex;
-  flex-direction: column;
+  flex-direction: row;
   align-items: center;
-  gap: 4px;
+  justify-content: center;
+  gap: 0;
   width: 100%;
+  height: 22px;
+  min-height: 22px;
+  flex: 0 0 22px;
   margin-top: 8px;
   color: #E9EDF4;
   font-size: 12px;
   font-weight: 600;
   letter-spacing: 0.025em;
-  line-height: 1.4;
+  line-height: 1;
   text-align: center;
-  overflow-wrap: anywhere;
+  overflow: hidden;
+  white-space: nowrap;
 }
-.linqa-action-status__message { display: inline-flex; align-items: center; justify-content: center; gap: 6px; max-width: 100%; }
+.linqa-action-status__message { display: inline-flex; align-items: center; justify-content: center; gap: 6px; max-width: 100%; min-width: 0; overflow: hidden; white-space: nowrap; }
+.linqa-action-status__message > span:last-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .linqa-action-status__message--warning { color: #FF5363; }
 .linqa-action-status__icon { flex: 0 0 auto; stroke-width: 2; }
 .linqa-action-status--warning,
@@ -763,12 +769,16 @@ body {
   justify-content: center;
   gap: 6px;
   max-width: 100%;
+  min-width: 0;
   border: 0;
   padding: 0;
   background: transparent;
   color: #FF5363;
   font: inherit;
   cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .linqa-action-status__switch:hover span { text-decoration: underline; text-underline-offset: 2px; }
 .linqa-action-status__switch:focus-visible { outline: 1px solid currentColor; outline-offset: 3px; }
