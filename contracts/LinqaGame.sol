@@ -4,6 +4,7 @@ pragma solidity ^0.8.20;
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 
 /// @title LinqaGame
 /// @notice TESTNET_SIMULATION_MODE: commit-reveal randomness using block prevrandao + player secret.
@@ -25,13 +26,28 @@ contract LinqaGame is Ownable, ReentrancyGuard {
     error StakeTooLow();
     error StakeExceedsMax();
     error TokenTransferFailed();
+    error InvalidSessionKey();
+    error InvalidRelaySignature();
+    error InvalidRelayNonce();
+    error RelayDeadlineExpired();
 
     uint256 public constant MIN_STAKE = 500_000; // 0.50 USDC (6 decimals)
     uint256 public constant MAX_STAKE = 10_000e6; // 10,000 USDC (6 decimals)
     uint256 public constant WAD = 1e18;
     uint256 public constant BASE_MULTIPLIER = 920000000000000000; // 0.92 WAD; 8% house edge
     uint256 public constant TOTAL_ROWS = 27; // Keeps the configured ladder below the 10,000x cap.
-    uint256 public constant GAME_VERSION = 3;
+    uint256 public constant GAME_VERSION = 4;
+    uint8 private constant RELAY_SELECT_TILE = 1;
+    uint8 private constant RELAY_CASH_OUT = 2;
+    uint256 private constant RELAY_DEADLINE_WINDOW = 5 minutes;
+    bytes32 private constant EIP712_DOMAIN_TYPEHASH = keccak256(
+        "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"
+    );
+    bytes32 private constant RELAY_ACTION_TYPEHASH = keccak256(
+        "RelayAction(address player,uint256 roundId,uint8 action,uint8 tileIndex,bytes32 secret,bytes32 nextCommitHash,uint256 nonce,uint256 deadline)"
+    );
+    bytes32 private constant NAME_HASH = keccak256("LinqaGame");
+    bytes32 private constant VERSION_HASH = keccak256("4");
 
     // The first 27 rows of the configured [4,2,4,3,4,4,5,6] repeat are playable.
     uint8[27] public rowSequence = [
@@ -74,6 +90,9 @@ contract LinqaGame is Ownable, ReentrancyGuard {
     mapping(uint256 => Round) private rounds;
     mapping(address => uint256) public activeRound;
     mapping(uint256 => uint256) private reservedByRound;
+    /// @notice Per-round temporary signer. It can only select tiles or cash out that round.
+    mapping(uint256 => address) public sessionKeyForRound;
+    mapping(uint256 => uint256) public relayNonceForRound;
 
     event RoundStarted(uint256 indexed roundId, address indexed player, uint256 stake);
     event TileSelected(
@@ -89,6 +108,7 @@ contract LinqaGame is Ownable, ReentrancyGuard {
     event RoundLost(uint256 indexed roundId, address indexed player, uint256 stake, uint256 rowIndex);
     event LiquidityAdded(address indexed provider, uint256 amount);
     event LiquidityRemoved(address indexed owner, uint256 amount);
+    event SessionKeyRegistered(uint256 indexed roundId, address indexed player, address indexed sessionKey);
 
     constructor(address _usdc, address _owner) Ownable(_owner) {
         if (block.chainid != 5_042_002) revert TestnetOnly();
@@ -102,6 +122,17 @@ contract LinqaGame is Ownable, ReentrancyGuard {
     }
 
     function startRound(uint256 stakeAmount, bytes32 commitHash) external nonReentrant {
+        _startRound(stakeAmount, commitHash, msg.sender);
+    }
+
+    /// @notice Starts a staked round and binds a temporary key for gas-sponsored gameplay.
+    /// @dev The session key cannot start rounds, approve tokens, or transfer funds outside this round.
+    function startRoundWithSession(uint256 stakeAmount, bytes32 commitHash, address sessionKey) external nonReentrant {
+        if (sessionKey == address(0)) revert InvalidSessionKey();
+        _startRound(stakeAmount, commitHash, sessionKey);
+    }
+
+    function _startRound(uint256 stakeAmount, bytes32 commitHash, address sessionKey) internal {
         if (!isTestnetSimulation) revert MainnetDisabled();
         if (activeRound[msg.sender] != 0) revert AlreadyActiveRound();
         if (commitHash == bytes32(0)) revert InvalidCommitHash();
@@ -129,17 +160,49 @@ contract LinqaGame is Ownable, ReentrancyGuard {
         r.wasSafe = false;
 
         activeRound[msg.sender] = roundId;
+        sessionKeyForRound[roundId] = sessionKey;
         reservedByRound[roundId] = initialPayout;
         reservedFunds += initialPayout;
 
         if (!usdc.transferFrom(msg.sender, address(this), stakeAmount)) revert TokenTransferFailed();
 
         emit RoundStarted(roundId, msg.sender, stakeAmount);
+        if (sessionKey != msg.sender) emit SessionKeyRegistered(roundId, msg.sender, sessionKey);
     }
 
     function selectTile(uint8 tileIndex, bytes32 secret) external nonReentrant {
         uint256 roundId = activeRound[msg.sender];
         if (roundId == 0) revert NoActiveRound();
+
+        _selectTile(msg.sender, roundId, tileIndex, secret, bytes32(0), false);
+    }
+
+    /// @notice Relayed tile selection. A round-scoped session key signs the exact action.
+    /// @dev Safe picks advance the row atomically, so one relayed transaction completes the pick.
+    function relaySelectTile(
+        address player,
+        uint8 tileIndex,
+        bytes32 secret,
+        bytes32 nextCommitHash,
+        uint256 nonce,
+        uint256 deadline,
+        bytes calldata signature
+    ) external nonReentrant {
+        uint256 roundId = activeRound[player];
+        if (roundId == 0) revert NoActiveRound();
+        _verifyRelayAction(player, roundId, RELAY_SELECT_TILE, tileIndex, secret, nextCommitHash, nonce, deadline, signature);
+        relayNonceForRound[roundId] = nonce + 1;
+        _selectTile(player, roundId, tileIndex, secret, nextCommitHash, true);
+    }
+
+    function _selectTile(
+        address player,
+        uint256 roundId,
+        uint8 tileIndex,
+        bytes32 secret,
+        bytes32 nextCommitHash,
+        bool advanceAfterSafePick
+    ) internal {
 
         Round storage r = rounds[roundId];
         if (r.status != RoundStatus.Active) revert RoundNotActive();
@@ -149,6 +212,7 @@ contract LinqaGame is Ownable, ReentrancyGuard {
         if (tileIndex >= tileCount) revert InvalidTileIndex();
 
         if (keccak256(abi.encodePacked(secret)) != r.commitHash) revert CommitMismatch();
+        if (advanceAfterSafePick && nextCommitHash == bytes32(0)) revert InvalidCommitHash();
 
         // Reserve the next possible cash-out before revealing the outcome. If the
         // pool cannot cover it, the player can still cash out at the current row.
@@ -168,7 +232,7 @@ contract LinqaGame is Ownable, ReentrancyGuard {
                     abi.encodePacked(
                         block.prevrandao,
                         secret,
-                        msg.sender,
+                        player,
                         roundId
                     )
                 )
@@ -184,10 +248,10 @@ contract LinqaGame is Ownable, ReentrancyGuard {
             r.rowResultPending = false;
 
             _releaseReservation(roundId);
-            activeRound[msg.sender] = 0;
+            activeRound[player] = 0;
 
-            emit TileSelected(roundId, msg.sender, r.rowIndex, tileIndex, false, losingTile, r.multiplierWAD);
-            emit RoundLost(roundId, msg.sender, r.stake, r.rowIndex);
+            emit TileSelected(roundId, player, r.rowIndex, tileIndex, false, losingTile, r.multiplierWAD);
+            emit RoundLost(roundId, player, r.stake, r.rowIndex);
             return;
         }
 
@@ -198,11 +262,20 @@ contract LinqaGame is Ownable, ReentrancyGuard {
         if (r.rowIndex + 1 >= TOTAL_ROWS) {
             r.status = RoundStatus.Won;
             r.rowResultPending = false;
+        } else if (advanceAfterSafePick) {
+            unchecked {
+                r.rowIndex += 1;
+            }
+            r.commitHash = nextCommitHash;
+            r.rowResultPending = false;
         } else {
             r.rowResultPending = true;
         }
 
-        emit TileSelected(roundId, msg.sender, r.rowIndex, tileIndex, true, losingTile, newMultiplier);
+        // The event records the row that was actually selected, including when the
+        // contract atomically moves the round to the next row.
+        uint256 selectedRowIndex = advanceAfterSafePick && r.status != RoundStatus.Won ? r.rowIndex - 1 : r.rowIndex;
+        emit TileSelected(roundId, player, selectedRowIndex, tileIndex, true, losingTile, newMultiplier);
     }
 
     function advanceRow(bytes32 newCommitHash) external {
@@ -222,7 +295,25 @@ contract LinqaGame is Ownable, ReentrancyGuard {
     }
 
     function cashOut() external nonReentrant {
-        uint256 roundId = activeRound[msg.sender];
+        _cashOut(msg.sender);
+    }
+
+    /// @notice Relayed cash out. Payout always goes to the round's original wallet.
+    function relayCashOut(
+        address player,
+        uint256 nonce,
+        uint256 deadline,
+        bytes calldata signature
+    ) external nonReentrant {
+        uint256 roundId = activeRound[player];
+        if (roundId == 0) revert NoActiveRound();
+        _verifyRelayAction(player, roundId, RELAY_CASH_OUT, 0, bytes32(0), bytes32(0), nonce, deadline, signature);
+        relayNonceForRound[roundId] = nonce + 1;
+        _cashOut(player);
+    }
+
+    function _cashOut(address player) internal {
+        uint256 roundId = activeRound[player];
         if (roundId == 0) revert NoActiveRound();
 
         Round storage r = rounds[roundId];
@@ -235,11 +326,52 @@ contract LinqaGame is Ownable, ReentrancyGuard {
         r.status = RoundStatus.Won;
 
         _releaseReservation(roundId);
-        activeRound[msg.sender] = 0;
+        activeRound[player] = 0;
 
-        if (!usdc.transfer(msg.sender, payout)) revert TokenTransferFailed();
+        if (!usdc.transfer(player, payout)) revert TokenTransferFailed();
 
-        emit CashedOut(roundId, msg.sender, payout, r.multiplierWAD);
+        emit CashedOut(roundId, player, payout, r.multiplierWAD);
+    }
+
+    function getRelayNonce(uint256 roundId) external view returns (uint256) {
+        return relayNonceForRound[roundId];
+    }
+
+    function _verifyRelayAction(
+        address player,
+        uint256 roundId,
+        uint8 action,
+        uint8 tileIndex,
+        bytes32 secret,
+        bytes32 nextCommitHash,
+        uint256 nonce,
+        uint256 deadline,
+        bytes calldata signature
+    ) internal view {
+        if (deadline < block.timestamp || deadline > block.timestamp + RELAY_DEADLINE_WINDOW) revert RelayDeadlineExpired();
+        if (nonce != relayNonceForRound[roundId]) revert InvalidRelayNonce();
+        address sessionKey = sessionKeyForRound[roundId];
+        if (sessionKey == address(0)) revert InvalidSessionKey();
+        bytes32 domainSeparator = keccak256(abi.encode(
+            EIP712_DOMAIN_TYPEHASH,
+            NAME_HASH,
+            VERSION_HASH,
+            block.chainid,
+            address(this)
+        ));
+        bytes32 structHash = keccak256(abi.encode(
+            RELAY_ACTION_TYPEHASH,
+            player,
+            roundId,
+            action,
+            tileIndex,
+            secret,
+            nextCommitHash,
+            nonce,
+            deadline
+        ));
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash));
+        if (ECDSA.recover(digest, signature) != sessionKey) revert InvalidRelaySignature();
     }
 
     function addLiquidity(uint256 amount) external onlyOwner nonReentrant {

@@ -26,6 +26,8 @@ contract LinqaGameTest is Test {
     address internal owner = makeAddr("owner");
     address internal alice = makeAddr("alice");
     address internal bob   = makeAddr("bob");
+    address internal relayer = makeAddr("relayer");
+    uint256 internal constant SESSION_KEY_PRIVATE_KEY = 0xA11CE;
 
     // ────────────────────────────────────────────────────────────
     // Shared fixtures
@@ -104,6 +106,38 @@ contract LinqaGameTest is Test {
         vm.prank(alice);
         game.startRound(stake, COMMIT_HASH);
         roundId = game.activeRound(alice);
+    }
+
+    function _relaySignature(
+        uint256 roundId,
+        uint8 action,
+        uint8 tileIndex,
+        bytes32 secret,
+        bytes32 nextCommitHash,
+        uint256 nonce,
+        uint256 deadline
+    ) internal returns (bytes memory signature) {
+        bytes32 domainSeparator = keccak256(abi.encode(
+            keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
+            keccak256("LinqaGame"),
+            keccak256("4"),
+            block.chainid,
+            address(game)
+        ));
+        bytes32 structHash = keccak256(abi.encode(
+            keccak256("RelayAction(address player,uint256 roundId,uint8 action,uint8 tileIndex,bytes32 secret,bytes32 nextCommitHash,uint256 nonce,uint256 deadline)"),
+            alice,
+            roundId,
+            action,
+            tileIndex,
+            secret,
+            nextCommitHash,
+            nonce,
+            deadline
+        ));
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash));
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(SESSION_KEY_PRIVATE_KEY, digest);
+        signature = abi.encodePacked(r, s, v);
     }
 
     // ──────────────────────────────────────────────────────────────
@@ -622,13 +656,73 @@ contract LinqaGameTest is Test {
         assertEq(address(game.usdc()), USDC_ADDR);
         assertEq(game.owner(), owner);
         assertTrue(game.isTestnetSimulation());
-        assertEq(game.gameVersion(), 3);
+        assertEq(game.gameVersion(), 4);
         assertEq(game.reservedFunds(), 0); // setUp adds liquidity before any round.
         // Freshly deployed game (separate from setUp game) checked in constructor tests.
     }
 
     function test_InitialLiquidityTracked() public view {
         assertEq(game.getAvailableLiquidity(), INITIAL_LIQUIDITY);
+    }
+
+    function test_RelayedSafePickAdvancesRowAndCashoutPaysPlayer() public {
+        address sessionKey = vm.addr(SESSION_KEY_PRIVATE_KEY);
+        bytes32 secret1 = bytes32("session_row_1");
+        bytes32 commit1 = keccak256(abi.encodePacked(secret1));
+        uint256 deadline = block.timestamp + 4 minutes;
+
+        vm.prank(alice);
+        game.startRoundWithSession(MIN_STAKE, COMMIT_HASH, sessionKey);
+        uint256 roundId = game.activeRound(alice);
+        assertEq(game.sessionKeyForRound(roundId), sessionKey);
+
+        uint8 tileCount = game.getRowTileCount(0);
+        uint8 losing = _losingTile(SECRET, alice, roundId, tileCount);
+        uint8 safeTile = (losing + 1) % tileCount;
+        bytes memory selectSignature = _relaySignature(
+            roundId, 1, safeTile, SECRET, commit1, 0, deadline
+        );
+
+        vm.prank(relayer);
+        game.relaySelectTile(alice, safeTile, SECRET, commit1, 0, deadline, selectSignature);
+
+        LinqaGame.Round memory round = game.getActiveRound(alice);
+        assertEq(round.rowIndex, 1, "relayed safe pick advances in one transaction");
+        assertFalse(round.rowResultPending, "relayed action leaves the next row ready");
+        assertEq(round.commitHash, commit1, "next row commitment is installed atomically");
+        assertEq(game.getRelayNonce(roundId), 1);
+
+        vm.expectRevert(LinqaGame.InvalidRelayNonce.selector);
+        vm.prank(relayer);
+        game.relaySelectTile(alice, safeTile, SECRET, commit1, 0, deadline, selectSignature);
+
+        uint256 aliceBefore = usdc.balanceOf(alice);
+        bytes memory cashoutSignature = _relaySignature(
+            roundId, 2, 0, bytes32(0), bytes32(0), 1, deadline
+        );
+        vm.prank(relayer);
+        game.relayCashOut(alice, 1, deadline, cashoutSignature);
+
+        assertGt(usdc.balanceOf(alice), aliceBefore, "relayed cashout transfers USDC to the player");
+        assertEq(game.activeRound(alice), 0);
+        assertEq(game.getRelayNonce(roundId), 2);
+    }
+
+    function test_Revert_RelayedActionFromWrongSessionKey() public {
+        address sessionKey = vm.addr(SESSION_KEY_PRIVATE_KEY);
+        vm.prank(alice);
+        game.startRoundWithSession(MIN_STAKE, COMMIT_HASH, sessionKey);
+        uint256 roundId = game.activeRound(alice);
+        uint256 deadline = block.timestamp + 4 minutes;
+        bytes memory signature = _relaySignature(
+            roundId, 1, 0, SECRET, bytes32("next_commit"), 0, deadline
+        );
+
+        // A modified signature must never authorize the action.
+        signature[0] = bytes1(uint8(signature[0]) ^ 0x01);
+        vm.expectRevert();
+        vm.prank(relayer);
+        game.relaySelectTile(alice, 0, SECRET, bytes32("next_commit"), 0, deadline, signature);
     }
 
     // ──────────────────────────────────────────────────────────────

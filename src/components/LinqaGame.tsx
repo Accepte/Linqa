@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
-import { useAccount, useWriteContract, useReadContract, useWaitForTransactionReceipt, useSwitchChain } from 'wagmi'
-import { erc20Abi, keccak256, encodePacked, parseEventLogs, type Address } from 'viem'
+import { useAccount, useWriteContract, useReadContract, useWaitForTransactionReceipt, useSwitchChain, usePublicClient } from 'wagmi'
+import { erc20Abi, keccak256, encodePacked, parseEventLogs, type Address, type Hex } from 'viem'
+import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts'
 import { arcTestnet } from 'viem/chains'
 import { ConnectKitButton } from 'connectkit'
 import { CircleAlert, Frown, History, Info, PartyPopper } from 'lucide-react'
@@ -17,6 +18,7 @@ import type { GameRound } from './linqa-types'
 // Injected post-deploy via VITE_LINQA_CONTRACT_ADDRESS env var
 // Fallback: zero address means "not deployed"
 const CONTRACT_ADDRESS: Address = (import.meta.env.VITE_LINQA_CONTRACT_ADDRESS ?? '0x0000000000000000000000000000000000000000') as Address
+const RELAY_SESSION_KEY = 'linqa:relay-session:v4'
 // Local play mode keeps the game interactive without requiring a wallet or contract.
 const LOCAL_DEMO_MODE: boolean = false
 
@@ -33,12 +35,65 @@ function createContractGameId(roundId: bigint, chainId: number): string {
   return `${prefix}${roundId.toString().padStart(12, '0').slice(-12)}`
 }
 
+function relaySessionStorageKey(address: Address, chainId: number): string {
+  return `${RELAY_SESSION_KEY}:${chainId}:${address.toLowerCase()}`
+}
+
+function loadRelaySession(address: Address, chainId: number) {
+  try {
+    const key = window.localStorage.getItem(relaySessionStorageKey(address, chainId))
+    return key && /^0x[0-9a-fA-F]{64}$/.test(key) ? privateKeyToAccount(key as Hex) : null
+  } catch {
+    return null
+  }
+}
+
+function createRelaySession(address: Address, chainId: number) {
+  const privateKey = generatePrivateKey()
+  window.localStorage.setItem(relaySessionStorageKey(address, chainId), privateKey)
+  return privateKeyToAccount(privateKey)
+}
+
+function clearRelaySession(address: Address | undefined, chainId: number) {
+  if (!address) return
+  try { window.localStorage.removeItem(relaySessionStorageKey(address, chainId)) } catch { /* Session key cleanup is best-effort. */ }
+}
+
+const RELAY_ACTION_TYPES = {
+  RelayAction: [
+    { name: 'player', type: 'address' },
+    { name: 'roundId', type: 'uint256' },
+    { name: 'action', type: 'uint8' },
+    { name: 'tileIndex', type: 'uint8' },
+    { name: 'secret', type: 'bytes32' },
+    { name: 'nextCommitHash', type: 'bytes32' },
+    { name: 'nonce', type: 'uint256' },
+    { name: 'deadline', type: 'uint256' },
+  ],
+} as const
+
+async function submitGameRelay(body: Record<string, unknown>): Promise<Hex> {
+  const response = await fetch('/api/relay', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  const result = await response.json().catch(() => null) as { txHash?: unknown; error?: unknown } | null
+  if (!response.ok || typeof result?.txHash !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(result.txHash)) {
+    throw new Error(typeof result?.error === 'string' ? result.error : 'The relayer could not submit this action.')
+  }
+  return result.txHash as Hex
+}
+
 const LINQA_ABI = [
   { name: 'gameVersion', type: 'function', stateMutability: 'pure', inputs: [], outputs: [{ name: '', type: 'uint256' }] },
   { name: 'startRound', type: 'function', stateMutability: 'nonpayable', inputs: [{ name: 'stakeAmount', type: 'uint256' }, { name: 'commitHash', type: 'bytes32' }], outputs: [] },
+  { name: 'startRoundWithSession', type: 'function', stateMutability: 'nonpayable', inputs: [{ name: 'stakeAmount', type: 'uint256' }, { name: 'commitHash', type: 'bytes32' }, { name: 'sessionKey', type: 'address' }], outputs: [] },
   { name: 'selectTile', type: 'function', stateMutability: 'nonpayable', inputs: [{ name: 'tileIndex', type: 'uint8' }, { name: 'secret', type: 'bytes32' }], outputs: [] },
   { name: 'advanceRow', type: 'function', stateMutability: 'nonpayable', inputs: [{ name: 'newCommitHash', type: 'bytes32' }], outputs: [] },
   { name: 'cashOut', type: 'function', stateMutability: 'nonpayable', inputs: [], outputs: [] },
+  { name: 'getRelayNonce', type: 'function', stateMutability: 'view', inputs: [{ name: 'roundId', type: 'uint256' }], outputs: [{ name: '', type: 'uint256' }] },
+  { name: 'sessionKeyForRound', type: 'function', stateMutability: 'view', inputs: [{ name: 'roundId', type: 'uint256' }], outputs: [{ name: '', type: 'address' }] },
   { name: 'getActiveRound', type: 'function', stateMutability: 'view', inputs: [{ name: 'player', type: 'address' }], outputs: [{ name: '', type: 'tuple', components: [
     { name: 'roundId', type: 'uint256' }, { name: 'player', type: 'address' }, { name: 'stake', type: 'uint256' },
     { name: 'rowIndex', type: 'uint256' }, { name: 'multiplierWAD', type: 'uint256' },
@@ -243,6 +298,7 @@ export default function LinqaGame() {
   const { switchChain, switchChainAsync } = useSwitchChain()
 
   const targetChainId = arcTestnet.id
+  const publicClient = usePublicClient({ chainId: targetChainId })
 
   // Game state
   const [stakeInput, setStakeInput] = useState('1')
@@ -262,6 +318,7 @@ export default function LinqaGame() {
   const [hasCurrentSecret, setHasCurrentSecret] = useState(false)
   const [pendingTileIndex, setPendingTileIndex] = useState<number | null>(null)
   const [errorMsg, setErrorMsg] = useState<string | null>(null)
+  const [relayTxHash, setRelayTxHash] = useState<Hex | undefined>()
 
   // Load 90-day history from Neon for the connected wallet. Older local entries
   // are submitted by transaction hash only; the server rechecks each receipt
@@ -327,6 +384,12 @@ export default function LinqaGame() {
   const currentRoundIdRef = useRef<bigint>(0n)
   const autoAdvanceRef = useRef(false)
   const pendingStartStakeRef = useRef<bigint | null>(null)
+  const relaySessionRef = useRef<ReturnType<typeof privateKeyToAccount> | null>(null)
+  const relayedActionRef = useRef(false)
+
+  useEffect(() => {
+    relaySessionRef.current = address ? loadRelaySession(address, targetChainId) : null
+  }, [address, targetChainId])
 
   useEffect(() => {
     const app = document.querySelector('.linqa-root') as HTMLElement | null
@@ -448,12 +511,22 @@ export default function LinqaGame() {
 
   // ── Write hooks ─────────────────────────────────────────────────────────────
   const { writeContract, data: writeTxHash, isPending: isWritePending, isError: isWriteError, error: writeError, reset: resetWrite } = useWriteContract()
-  const { isLoading: isTxConfirming, isSuccess: isTxSuccess, isError: isTxError, error: txError, data: receipt } = useWaitForTransactionReceipt({ hash: writeTxHash })
+  const activeTxHash = relayTxHash ?? writeTxHash
+  const { isLoading: isTxConfirming, isSuccess: isTxSuccess, isError: isTxError, error: txError, data: receipt } = useWaitForTransactionReceipt({ hash: activeTxHash })
 
   const startApprovedRound = useCallback((stakeAmount: bigint) => {
     if (!address) {
       setTxPhase('idle')
       setErrorMsg('Reconnect your wallet to start the game.')
+      return
+    }
+    let session: ReturnType<typeof privateKeyToAccount>
+    try {
+      session = createRelaySession(address, targetChainId)
+      relaySessionRef.current = session
+    } catch {
+      setTxPhase('idle')
+      setErrorMsg('Could not prepare the private gameplay session on this device.')
       return
     }
     secretsRef.current = Array.from({ length: 27 }, () => generateSecret())
@@ -474,8 +547,8 @@ export default function LinqaGame() {
       writeContract({
         address: CONTRACT_ADDRESS,
         abi: LINQA_ABI,
-        functionName: 'startRound',
-        args: [stakeAmount, commitHash],
+        functionName: 'startRoundWithSession',
+        args: [stakeAmount, commitHash, session.address],
         chainId: targetChainId,
       })
     } catch {
@@ -483,6 +556,8 @@ export default function LinqaGame() {
       setHasCurrentSecret(false)
       secretsRef.current = []
       clearSecrets(address, targetChainId)
+      relaySessionRef.current = null
+      clearRelaySession(address, targetChainId)
       setErrorMsg('Could not send the start transaction. Please retry.')
     }
   }, [address, targetChainId, writeContract])
@@ -521,7 +596,9 @@ export default function LinqaGame() {
   // ── Track tx completion ─────────────────────────────────────────────────────
   useEffect(() => {
     if (!isTxSuccess || !receipt) return
-    const hash = writeTxHash
+    const hash = activeTxHash
+    const wasRelayedAction = relayedActionRef.current
+    relayedActionRef.current = false
 
     if (txPhase === 'approving') {
       const approvedStake = pendingStartStakeRef.current
@@ -592,7 +669,13 @@ export default function LinqaGame() {
           window.setTimeout(() => {
             setTxPhase('idle')
             if (r?.status === 2) {
+              setCurrentRowIndex(Number(r.rowIndex))
               setRoundPhase('collectable')
+            } else if (wasRelayedAction) {
+              setCurrentRowIndex(Number(r?.rowIndex ?? rowIndex + 1))
+              setHasCurrentSecret(!!secretsRef.current[Number(r?.rowIndex ?? rowIndex + 1)])
+              autoAdvanceRef.current = false
+              setRoundPhase('active')
             } else {
               setHasCurrentSecret(!!secretsRef.current[rowIndex + 1])
               autoAdvanceRef.current = true
@@ -615,6 +698,8 @@ export default function LinqaGame() {
         currentRoundIdRef.current = 0n
         secretsRef.current = []
         clearSecrets(address, targetChainId)
+        relaySessionRef.current = null
+        clearRelaySession(address, targetChainId)
         if (loss) {
           addToHistory(eventArgs.roundId, loss.args.stake, false, eventArgs.newMultiplierWAD, eventArgs.newMultiplierWAD, hash, targetChainId)
         }
@@ -651,6 +736,8 @@ export default function LinqaGame() {
         setHasCurrentSecret(false)
         secretsRef.current = []
         clearSecrets(address, targetChainId)
+        relaySessionRef.current = null
+        clearRelaySession(address, targetChainId)
         currentRoundIdRef.current = 0n
       } else {
         setErrorMsg('The transaction confirmed, but its payout event could not be read. Check the explorer before retrying.')
@@ -659,6 +746,7 @@ export default function LinqaGame() {
       void refetchBalance()
     }
     resetWrite()
+    setRelayTxHash(undefined)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isTxSuccess, receipt])
 
@@ -668,6 +756,8 @@ export default function LinqaGame() {
       if (txPhase === 'starting') {
         secretsRef.current = []
         clearSecrets(address, targetChainId)
+        relaySessionRef.current = null
+        clearRelaySession(address, targetChainId)
       }
       setTxPhase('idle')
       setPendingTileIndex(null)
@@ -682,10 +772,13 @@ export default function LinqaGame() {
       if (txPhase === 'starting') {
         secretsRef.current = []
         clearSecrets(address, targetChainId)
+        relaySessionRef.current = null
+        clearRelaySession(address, targetChainId)
       }
       setTxPhase('idle')
       setPendingTileIndex(null)
       setErrorMsg((txError as { shortMessage?: string } | null)?.shortMessage ?? 'The transaction did not complete. Your onchain round state is unchanged.')
+      setRelayTxHash(undefined)
       resetWrite()
     }
   }, [isTxError, txError, resetWrite, txPhase, address, targetChainId])
@@ -739,6 +832,57 @@ export default function LinqaGame() {
     }
   }, [walletChainId, targetChainId, switchChainAsync])
 
+  const sendRelayedAction = useCallback(async (
+    action: 'selectTile' | 'cashOut',
+    details: { tileIndex: number; secret: Hex; nextCommitHash: Hex },
+  ) => {
+    if (!address || !publicClient) throw new Error('Reconnect your wallet before continuing.')
+    if (deployedGameVersion !== 4n) throw new Error('The active contract does not support gas-sponsored play yet.')
+    const session = relaySessionRef.current ?? loadRelaySession(address, targetChainId)
+    if (!session) throw new Error('This round’s private gameplay session is missing. Reopen it in the browser where you started it.')
+    relaySessionRef.current = session
+    const roundId = currentRoundIdRef.current
+    if (roundId === 0n) throw new Error('The active round could not be found. Refresh the game and retry.')
+    const nonce = await publicClient.readContract({
+      address: CONTRACT_ADDRESS,
+      abi: LINQA_ABI,
+      functionName: 'getRelayNonce',
+      args: [roundId],
+    })
+    const deadline = Math.floor(Date.now() / 1_000) + 180
+    const actionCode = action === 'selectTile' ? 1 : 2
+    const signature = await session.signTypedData({
+      domain: { name: 'LinqaGame', version: '4', chainId: targetChainId, verifyingContract: CONTRACT_ADDRESS },
+      types: RELAY_ACTION_TYPES,
+      primaryType: 'RelayAction',
+      message: {
+        player: address,
+        roundId,
+        action: actionCode,
+        tileIndex: details.tileIndex,
+        secret: details.secret,
+        nextCommitHash: details.nextCommitHash,
+        nonce,
+        deadline: BigInt(deadline),
+      },
+    })
+    const payload = action === 'selectTile'
+      ? { action, contractAddress: CONTRACT_ADDRESS, player: address, roundId: roundId.toString(), tileIndex: details.tileIndex, secret: details.secret, nextCommitHash: details.nextCommitHash, nonce: nonce.toString(), deadline, signature }
+      : { action, contractAddress: CONTRACT_ADDRESS, player: address, roundId: roundId.toString(), nonce: nonce.toString(), deadline, signature }
+
+    relayedActionRef.current = true
+    setRelayTxHash(undefined)
+    resetWrite()
+    try {
+      const hash = await submitGameRelay(payload)
+      setRelayTxHash(hash)
+      return hash
+    } catch (error) {
+      relayedActionRef.current = false
+      throw error
+    }
+  }, [address, publicClient, deployedGameVersion, targetChainId, resetWrite])
+
   const handleStartGame = useCallback(async () => {
     if (LOCAL_DEMO_MODE) {
       setErrorMsg(null)
@@ -786,6 +930,20 @@ export default function LinqaGame() {
       return
     }
 
+    if (deployedGameVersion === 4n) {
+      try {
+        const response = await fetch('/api/relay', { method: 'GET', cache: 'no-store' })
+        const status = await response.json() as { ready?: boolean }
+        if (!response.ok || status.ready !== true) {
+          setErrorMsg('Sponsored gameplay is temporarily unavailable. Please try again later.')
+          return
+        }
+      } catch {
+        setErrorMsg('Sponsored gameplay is temporarily unavailable. Please try again later.')
+        return
+      }
+    }
+
     const stakeAmount = stakeRaw.raw
     setCurrentGameId(null)
 
@@ -810,7 +968,7 @@ export default function LinqaGame() {
     }
 
     startApprovedRound(stakeAmount)
-  }, [address, usdcAddress, usdcAllowance, stakeInput, ensureChain, startApprovedRound, writeContract, targetChainId])
+  }, [address, usdcAddress, usdcAllowance, stakeInput, ensureChain, startApprovedRound, writeContract, targetChainId, deployedGameVersion])
 
   const handleTileClick = useCallback(async (tileIndex: number) => {
     if (LOCAL_DEMO_MODE) {
@@ -879,19 +1037,34 @@ export default function LinqaGame() {
     setTxPhase('selecting')
 
     try {
-      writeContract({
-        address: CONTRACT_ADDRESS,
-        abi: LINQA_ABI,
-        functionName: 'selectTile',
-        args: [tileIndex, secret],
-        chainId: targetChainId,
-      })
+      if (deployedGameVersion === 4n && (relaySessionRef.current || loadRelaySession(address, targetChainId))) {
+        const nextRowIndex = currentRowIndex + 1
+        const nextSecret = secretsRef.current[nextRowIndex] ?? generateSecret()
+        if (!secretsRef.current[nextRowIndex]) {
+          secretsRef.current[nextRowIndex] = nextSecret
+          saveSecrets(address, targetChainId, secretsRef.current)
+        }
+        await sendRelayedAction('selectTile', {
+          tileIndex,
+          secret,
+          nextCommitHash: computeCommitHash(nextSecret),
+        })
+      } else {
+        relayedActionRef.current = false
+        writeContract({
+          address: CONTRACT_ADDRESS,
+          abi: LINQA_ABI,
+          functionName: 'selectTile',
+          args: [tileIndex, secret],
+          chainId: targetChainId,
+        })
+      }
     } catch {
       setTxPhase('idle')
       setPendingTileIndex(null)
-      setErrorMsg('Transaction failed')
+      setErrorMsg('Could not submit that tile. Your round is unchanged; please retry.')
     }
-  }, [address, roundPhase, txPhase, ensureChain, currentRowIndex, currentMultiplierWAD, stakeInput, writeContract, targetChainId, demoRowPattern, currentGameId, addDemoToHistory])
+  }, [address, roundPhase, txPhase, ensureChain, currentRowIndex, currentMultiplierWAD, stakeInput, writeContract, targetChainId, demoRowPattern, currentGameId, addDemoToHistory, deployedGameVersion, sendRelayedAction])
 
   const handleAdvanceRow = useCallback(async () => {
     if (LOCAL_DEMO_MODE) return
@@ -960,18 +1133,24 @@ export default function LinqaGame() {
 
     setTxPhase('cashingout')
     try {
-      writeContract({
-        address: CONTRACT_ADDRESS,
-        abi: LINQA_ABI,
-        functionName: 'cashOut',
-        chainId: targetChainId,
-        args: [],
-      })
+      if (deployedGameVersion === 4n && (relaySessionRef.current || loadRelaySession(address, targetChainId))) {
+        const zero = `0x${'00'.repeat(32)}` as Hex
+        await sendRelayedAction('cashOut', { tileIndex: 0, secret: zero, nextCommitHash: zero })
+      } else {
+        relayedActionRef.current = false
+        writeContract({
+          address: CONTRACT_ADDRESS,
+          abi: LINQA_ABI,
+          functionName: 'cashOut',
+          chainId: targetChainId,
+          args: [],
+        })
+      }
     } catch {
       setTxPhase('idle')
-      setErrorMsg('Cash out failed')
+      setErrorMsg('Cash out could not be submitted. Your round remains on-chain; please retry.')
     }
-  }, [address, roundPhase, currentRowIndex, txPhase, ensureChain, currentMultiplierWAD, stakeInput, writeContract, targetChainId, currentGameId, addDemoToHistory])
+  }, [address, roundPhase, currentRowIndex, txPhase, ensureChain, currentMultiplierWAD, stakeInput, writeContract, targetChainId, currentGameId, addDemoToHistory, deployedGameVersion, sendRelayedAction])
 
   const handleReset = useCallback(() => {
     if (LOCAL_DEMO_MODE) setDemoRowPattern(createDemoRowPattern())
@@ -989,6 +1168,8 @@ export default function LinqaGame() {
     secretsRef.current = []
     setHasCurrentSecret(false)
     clearSecrets(address, targetChainId)
+    relaySessionRef.current = null
+    clearRelaySession(address, targetChainId)
     autoAdvanceRef.current = false
     currentRoundIdRef.current = 0n
     void refetchRound()
@@ -1022,7 +1203,7 @@ export default function LinqaGame() {
     : BASE_MULTIPLIER
 
   const contractDeployed = CONTRACT_ADDRESS !== '0x0000000000000000000000000000000000000000'
-  const contractCompatible = deployedGameVersion === 3n
+  const contractCompatible = deployedGameVersion === 4n
   const currentRound = activeRoundData as { roundId?: bigint; status?: number } | undefined
   const hasExistingRound = !!currentRound?.roundId && currentRound.roundId !== 0n && (currentRound.status === 1 || currentRound.status === 2)
   const isWrongChain = isConnected && walletChainId !== targetChainId
@@ -1043,7 +1224,7 @@ export default function LinqaGame() {
     if (isBusy) {
       if (txPhase === 'approving') return 'APPROVING...'
       if (txPhase === 'starting') return 'STARTING...'
-      if (txPhase === 'selecting') return 'CONFIRMING...'
+      if (txPhase === 'selecting') return 'REVEALING...'
       if (txPhase === 'advancing') return 'ADVANCING...'
       if (txPhase === 'cashingout') return 'CASHING OUT...'
       return 'CONFIRMING...'

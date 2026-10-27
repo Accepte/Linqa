@@ -45,7 +45,7 @@ contract DeployLinqaGame is Script {
 
         vm.startBroadcast(deployer);
         game = new LinqaGame(ARC_TESTNET_USDC, deployer);
-        require(game.gameVersion() == 3, "Unexpected game version");
+        require(game.gameVersion() == 4, "Unexpected game version");
         require(game.owner() == deployer, "Unexpected owner");
         require(game.usdc() == IERC20(ARC_TESTNET_USDC), "Unexpected USDC address");
         require(game.isTestnetSimulation(), "Testnet simulation must be enabled");
@@ -67,7 +67,7 @@ contract DeployLinqaGame is Script {
         require(game.getAvailableLiquidity() == initialLiquidity, "Liquidity post-check failed");
         vm.stopBroadcast();
 
-        console2.log("LinqaGame v3 deployed on Arc Testnet:", address(game));
+        console2.log("LinqaGame v4 deployed on Arc Testnet:", address(game));
         console2.log("Owner:", deployer);
         console2.log("Initial liquidity (USDC base units):", initialLiquidity);
         console2.log("Verify the address and source on the Arc Testnet explorer before frontend use.");

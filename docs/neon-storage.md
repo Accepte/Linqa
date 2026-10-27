@@ -5,7 +5,7 @@ The Vercel API stores completed Arc Testnet rounds in Neon. It reads the result,
 ## Environment
 
 - `DATABASE_URL`: the pooled Neon connection string. Keep it server-side; never name it `VITE_DATABASE_URL`.
-- `LINQA_CONTRACT_ADDRESS`: recommended server-only copy of the active version 3 contract address. The API temporarily falls back to `VITE_LINQA_CONTRACT_ADDRESS` if this is not set.
+- `LINQA_CONTRACT_ADDRESS`: recommended server-only copy of the active contract address. The API temporarily falls back to `VITE_LINQA_CONTRACT_ADDRESS` if this is not set.
 - `ARC_TESTNET_RPC_URL`: optional; defaults to `https://rpc.testnet.arc.io`.
 - `LINQA_ADMIN_TOKEN`: required only to create or disable saved announcements. Generate a long random value and add it to Vercel as a server-only environment variable before managing announcements.
 
