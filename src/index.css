@@ -478,8 +478,8 @@ body {
 .tile--clickable:hover .tile-badge-frame { transform: translateY(-1px) scale(1.04); }
 .tile--clickable:hover .tile-badge { filter: drop-shadow(0 3px 6px rgba(15,28,48,.34)); }
 .tile--safe .tile-badge { --badge-color: #3FBE7C; --badge-logo-color: #E9EDF4; --badge-rim-color: #F2DFB4; filter: drop-shadow(0 0 8px rgba(63,190,124,.64)); }
-.tile--safe .tile-badge-inner { animation: tile-coin-flip .9s cubic-bezier(.33,0,.2,1) 1; }
-.tile--safe .tile-badge__gloss rect { animation: tile-gloss-sweep .9s ease-in-out 1 both; }
+.tile--safe .tile-badge-inner { animation: tile-coin-flip .55s cubic-bezier(.33,0,.2,1) 1; }
+.tile--safe .tile-badge__gloss rect { animation: tile-gloss-sweep .55s ease-in-out 1 both; }
 .tile--losing .tile-badge { --badge-color: #C8495A; --badge-logo-color: #E9EDF4; --badge-rim-color: #141A27; filter: drop-shadow(0 0 9px rgba(200,73,90,.62)); }
 .tile--losing .tile-badge-inner { animation: tile-crack-shake .4s ease-out 1; }
 .tile--losing .tile-badge__crack path { animation: tile-crack-draw .35s ease-out forwards; }
@@ -1699,12 +1699,22 @@ body {
   .history-detail__label { font-size: 8px; }
   .history-detail__id { font-size: 9px; }
   .linqa-result { font-size: 12px; line-height: 1.4; }
+  .fortune-panel.win-panel .fortune-game-id { flex-wrap: nowrap; gap: 4px; padding-inline: 0; }
+  .fortune-panel.win-panel .fortune-game-id > span { font-size: 10px; }
+  .fortune-panel.win-panel .fortune-game-id code { flex: 0 1 auto; overflow: hidden; font-size: 11px; overflow-wrap: normal; text-overflow: ellipsis; white-space: nowrap; }
+  .fortune-panel.win-panel .fortune-game-id button { flex-basis: 18px; width: 18px; height: 18px; }
+  .fortune-panel.win-panel .fortune-tx-link { gap: 2px; font-size: 8px; }
+  .fortune-panel.win-panel .fortune-tx-link svg { width: 10px; height: 10px; }
 }
 
 @media (max-width: 420px) {
   .history-detail { gap: 2px; }
   .history-detail__meta { gap: 3px; }
   .history-detail__id { font-size: 8px; }
+  .fortune-panel.win-panel .fortune-game-id { gap: 3px; }
+  .fortune-panel.win-panel .fortune-game-id > span { font-size: 9px; }
+  .fortune-panel.win-panel .fortune-game-id code { font-size: 10px; }
+  .fortune-panel.win-panel .fortune-tx-link { font-size: 7px; }
 }
 
 @media (max-width: 380px) {

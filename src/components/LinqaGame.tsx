@@ -328,6 +328,7 @@ export default function LinqaGame() {
   const [historyRounds, setHistoryRounds] = useState<GameRound[]>(readHistory)
   const [activityRounds, setActivityRounds] = useState<GameRound[]>([])
   const [announcements, setAnnouncements] = useState<LiveAnnouncement[]>([])
+  const [dismissedOutcomeNoticeId, setDismissedOutcomeNoticeId] = useState('')
   const [noticeIndex, setNoticeIndex] = useState(0)
   const [noticePaused, setNoticePaused] = useState(false)
   const noticeClock = useRef({ id: '', remaining: 0, startedAt: 0 })
@@ -421,11 +422,13 @@ export default function LinqaGame() {
   // Secrets per row
   const secretsRef = useRef<`0x${string}`[]>([])
   const currentRoundIdRef = useRef<bigint>(0n)
+  const completedRoundIdRef = useRef<bigint>(0n)
   const autoAdvanceRef = useRef(false)
   const startingRequestRef = useRef(false)
   const pendingStartStakeRef = useRef<bigint | null>(null)
   const relaySessionRef = useRef<ReturnType<typeof privateKeyToAccount> | null>(null)
   const relayedActionRef = useRef(false)
+  const tileActionInFlightRef = useRef(false)
 
   useEffect(() => {
     relaySessionRef.current = address ? loadRelaySession(address, targetChainId) : null
@@ -577,7 +580,7 @@ export default function LinqaGame() {
   // ── Write hooks ─────────────────────────────────────────────────────────────
   const { writeContract, data: writeTxHash, isPending: isWritePending, isError: isWriteError, error: writeError, reset: resetWrite } = useWriteContract()
   const activeTxHash = relayTxHash ?? writeTxHash
-  const { isLoading: isTxConfirming, isSuccess: isTxSuccess, isError: isTxError, error: txError, data: receipt } = useWaitForTransactionReceipt({ hash: activeTxHash })
+  const { isLoading: isTxConfirming, isSuccess: isTxSuccess, isError: isTxError, error: txError, data: receipt } = useWaitForTransactionReceipt({ hash: activeTxHash, pollingInterval: 1_000 })
 
   const startApprovedRound = useCallback((stakeAmount: bigint) => {
     if (!address) {
@@ -634,6 +637,9 @@ export default function LinqaGame() {
   useEffect(() => {
     if (!activeRoundData) return
     const r = activeRoundData as { roundId: bigint; status: number; rowIndex: bigint; multiplierWAD: bigint; rowResultPending: boolean; losingTile: number; selectedTile: number; wasSafe: boolean }
+    // A delayed RPC response can return the just-completed round after the
+    // result dialog closes. Never restore that stale round into the UI.
+    if (r.roundId !== 0n && r.roundId === completedRoundIdRef.current) return
     if ((r.status === 1 /* Active */ || r.status === 2 /* Won */) && r.roundId !== 0n) {
       currentRoundIdRef.current = r.roundId
       setCurrentGameId(createContractGameId(r.roundId, targetChainId))
@@ -698,12 +704,14 @@ export default function LinqaGame() {
         .find(event => event.address.toLowerCase() === CONTRACT_ADDRESS.toLowerCase())
       if (started) {
         currentRoundIdRef.current = started.args.roundId
+        completedRoundIdRef.current = 0n
         setCurrentGameId(createContractGameId(started.args.roundId, targetChainId))
       }
       void refetchRound()
       void refetchBalance()
       toast.success('Round started')
     } else if (txPhase === 'selecting') {
+      tileActionInFlightRef.current = false
       const selection = parseEventLogs({ abi: LINQA_ABI, logs: receipt.logs, eventName: 'TileSelected', strict: true })
         .find(event => event.address.toLowerCase() === CONTRACT_ADDRESS.toLowerCase())
       if (!selection) {
@@ -728,15 +736,28 @@ export default function LinqaGame() {
       if (address) saveSecrets(address, targetChainId, revealedSecrets)
 
       if (eventArgs.safe) {
+        const nextMultiplier = eventArgs.newMultiplierWAD
+        setCurrentMultiplierWAD(nextMultiplier)
+        setLastResult(null)
+        const nextRowIndex = rowIndex + 1
+        const isRelayedFinalPick = wasRelayedAction && nextRowIndex >= CONTRACT_ROW_PATTERN.length
+        if (wasRelayedAction && !isRelayedFinalPick) {
+          // A relayed safe pick advances the contract row atomically. The
+          // receipt event already proves the result, so avoid an extra RPC read.
+          window.setTimeout(() => {
+            setTxPhase('idle')
+            setCurrentRowIndex(nextRowIndex)
+            setHasCurrentSecret(!!secretsRef.current[nextRowIndex])
+            autoAdvanceRef.current = false
+            setRoundPhase('active')
+          }, 550)
+          return
+        }
         void refetchRound().then(({ data }) => {
           const r = data as { roundId: bigint; status: number; rowIndex: bigint; multiplierWAD: bigint; rowResultPending: boolean; losingTile: number; selectedTile: number; wasSafe: boolean; stake: bigint } | undefined
-          const newMultiplier = eventArgs.newMultiplierWAD
-          setCurrentMultiplierWAD(newMultiplier)
           if (r?.status === 2 /* Won — full board complete; payout still needs claiming */) {
-            const payout = (r.stake * newMultiplier) / WAD
+            const payout = (r.stake * nextMultiplier) / WAD
             setLastResult({ type: 'collectable', amount: formatUsdc6Rounded(payout, targetChainId) })
-          } else {
-            setLastResult(null)
           }
           window.setTimeout(() => {
             setTxPhase('idle')
@@ -753,7 +774,7 @@ export default function LinqaGame() {
               autoAdvanceRef.current = true
               setRoundPhase('result_pending')
             }
-          }, 900)
+          }, 550)
         }).catch(() => {
           setTxPhase('idle')
           setErrorMsg('The tile was revealed, but the latest round state could not be loaded. Refresh before continuing.')
@@ -763,6 +784,7 @@ export default function LinqaGame() {
         const loss = parseEventLogs({ abi: LINQA_ABI, logs: receipt.logs, eventName: 'RoundLost', strict: true })
           .find(event => event.address.toLowerCase() === CONTRACT_ADDRESS.toLowerCase())
         const gameId = createContractGameId(eventArgs.roundId, targetChainId)
+        completedRoundIdRef.current = eventArgs.roundId
         const lostStake = loss?.args.stake ?? 0n
         setCurrentGameId(gameId)
         setHasCurrentSecret(false)
@@ -797,6 +819,7 @@ export default function LinqaGame() {
         .find(event => event.address.toLowerCase() === CONTRACT_ADDRESS.toLowerCase())
       if (cashedOut) {
         const args = cashedOut.args
+        completedRoundIdRef.current = args.roundId
         const amount = formatUsdc6Rounded(args.payout, targetChainId)
         const gameId = createContractGameId(args.roundId, targetChainId)
         setCurrentGameId(gameId)
@@ -824,6 +847,7 @@ export default function LinqaGame() {
 
   useEffect(() => {
     if (isWriteError) {
+      tileActionInFlightRef.current = false
       startingRequestRef.current = false
       pendingStartStakeRef.current = null
       if (txPhase === 'starting') {
@@ -842,6 +866,7 @@ export default function LinqaGame() {
 
   useEffect(() => {
     if (isTxError) {
+      tileActionInFlightRef.current = false
       startingRequestRef.current = false
       pendingStartStakeRef.current = null
       if (txPhase === 'starting') {
@@ -869,10 +894,12 @@ export default function LinqaGame() {
       txHash: hash ?? null,
       chainId,
       createdAt: Date.now(),
+      playerAddress: address,
     }
     setHistoryRounds(prev => {
       return [round, ...prev.filter(existing => existing.roundId !== round.roundId)].slice(0, 2_000)
     })
+    setActivityRounds(prev => [round, ...prev.filter(existing => existing.roundId !== round.roundId)].slice(0, 5))
     if (hash && chainId === arcTestnet.id) void persistConfirmedRound(hash)
   }
 
@@ -1126,11 +1153,20 @@ export default function LinqaGame() {
     if (!address) return
     if (roundPhase !== 'active') return
     if (txPhase !== 'idle') return
-    if (!await ensureChain()) return
+    if (tileActionInFlightRef.current) return
+    tileActionInFlightRef.current = true
+    if (!await ensureChain()) {
+      tileActionInFlightRef.current = false
+      return
+    }
     setErrorMsg(null)
 
     const secret = secretsRef.current[currentRowIndex]
-    if (!secret) { setErrorMsg('The saved row key is unavailable. Cash out to safely end this round.'); return }
+    if (!secret) {
+      tileActionInFlightRef.current = false
+      setErrorMsg('The saved row key is unavailable. Cash out to safely end this round.')
+      return
+    }
 
     setPendingTileIndex(tileIndex)
     setTxPhase('selecting')
@@ -1159,6 +1195,7 @@ export default function LinqaGame() {
         })
       }
     } catch {
+      tileActionInFlightRef.current = false
       setTxPhase('idle')
       setPendingTileIndex(null)
       setErrorMsg('Could not submit that tile. Your round is unchanged; please retry.')
@@ -1253,6 +1290,7 @@ export default function LinqaGame() {
 
   const handleReset = useCallback(() => {
     startingRequestRef.current = false
+    tileActionInFlightRef.current = false
     relayedActionRef.current = false
     pendingStartStakeRef.current = null
     setRelayTxHash(undefined)
@@ -1362,7 +1400,9 @@ export default function LinqaGame() {
     return 'START GAME'
   }
 
-  const outcomeNotices: NoticeBarItem[] = activityRounds.slice(0, 5).map(round => {
+  const latestActivityRound = activityRounds[0]
+  const latestOutcomeNoticeId = latestActivityRound ? `round-${latestActivityRound.roundId}` : ''
+  const outcomeNotices: NoticeBarItem[] = latestActivityRound && latestOutcomeNoticeId !== dismissedOutcomeNoticeId ? [latestActivityRound].map(round => {
     const isMine = !!address && round.playerAddress?.toLowerCase() === address.toLowerCase()
     const player = isMine
       ? 'You'
@@ -1379,7 +1419,7 @@ export default function LinqaGame() {
       amount: `$${amount} USDC`,
       subtitle: won ? 'Congratulations' : 'uhhh try again',
     }
-  })
+  }) : []
   const announcementNotices: NoticeBarItem[] = announcements.slice(0, 3).map(announcement => ({
     id: `announcement-${announcement.id}`,
     tone: announcement.kind,
@@ -1424,11 +1464,15 @@ export default function LinqaGame() {
   const activeNoticeDuration = activeNotice.tone === 'warning' ? 6_000 : 4_400
 
   useEffect(() => {
+    setNoticeIndex(0)
+  }, [latestOutcomeNoticeId])
+
+  useEffect(() => {
     setNoticeIndex(index => index % noticeFeed.length)
   }, [noticeFeed.length])
 
   useEffect(() => {
-    if (noticeFeed.length < 2 || noticePaused) return
+    if (isPlaying || noticeFeed.length < 2 || noticePaused) return
     const clock = noticeClock.current
     if (clock.id !== activeNotice.id) {
       clock.id = activeNotice.id
@@ -1438,6 +1482,11 @@ export default function LinqaGame() {
     const timeout = window.setTimeout(() => {
       clock.remaining = 0
       clock.startedAt = 0
+      if (activeNotice.tone === 'win' || activeNotice.tone === 'loss') {
+        setDismissedOutcomeNoticeId(activeNotice.id)
+        setNoticeIndex(0)
+        return
+      }
       setNoticeIndex(index => (index + 1) % noticeFeed.length)
     }, clock.remaining)
     return () => {
@@ -1447,7 +1496,7 @@ export default function LinqaGame() {
         clock.startedAt = 0
       }
     }
-  }, [activeNotice.id, activeNoticeDuration, noticeFeed.length, noticePaused])
+  }, [activeNotice.id, activeNotice.tone, activeNoticeDuration, isPlaying, noticeFeed.length, noticePaused])
 
   let actionStatus = ''
   let actionStatusTone = ''
