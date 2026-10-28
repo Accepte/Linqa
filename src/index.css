@@ -1147,9 +1147,10 @@ body {
   text-align: center;
 }
 .fortune-panel.loss-panel .fortune-game-id, .fortune-panel.win-panel .fortune-game-id { background: transparent; }
-.fortune-panel.win-panel .fortune-game-id { margin-top: auto; margin-bottom: 6px; padding-top: 0; padding-bottom: 0; transform: none; }
+.fortune-panel.win-panel .fortune-game-id { flex-wrap: nowrap; gap: clamp(3px, .8vw, 7px); width: 100%; margin-top: auto; margin-bottom: 6px; padding-top: 0; padding-bottom: 0; transform: none; white-space: nowrap; }
 .fortune-game-id > span { flex: 0 0 auto; color: #E9EDF4; font-size: 15px; font-weight: 800; letter-spacing: 0; }
 .fortune-game-id code { min-width: 0; color: #E9EDF4; font: 700 15px/1.3 'DM Sans', sans-serif; overflow-wrap: anywhere; }
+.fortune-panel.win-panel .fortune-game-id code { flex: 0 1 auto; overflow: hidden; overflow-wrap: normal; text-overflow: ellipsis; white-space: nowrap; }
 .fortune-game-id button { display: grid; place-items: center; flex: 0 0 20px; width: 20px; height: 20px; padding: 0; border: 0; border-radius: 0; background: transparent; color: #E9EDF4; cursor: pointer; }
 .fortune-tx-link { display: inline-flex; align-items: center; flex: 0 0 auto; gap: 3px; color: #D6BE8B; font: 700 9px/1 'DM Sans', sans-serif; text-decoration: none; white-space: nowrap; }
 .fortune-tx-link:hover { color: #F2DFB4; }
