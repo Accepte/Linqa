@@ -6,18 +6,21 @@ import type { GameRound } from './linqa-types'
 interface HistoryPanelProps {
   rounds: GameRound[]
   onClose: () => void
+  openedAt: number
 }
 
-export default function HistoryPanel({ rounds, onClose }: HistoryPanelProps) {
+export default function HistoryPanel({ rounds, onClose, openedAt }: HistoryPanelProps) {
   const closeButtonRef = useRef<HTMLButtonElement>(null)
   const onCloseRef = useRef(onClose)
   const [expandedRoundId, setExpandedRoundId] = useState<string | null>(null)
   const [copiedRoundId, setCopiedRoundId] = useState<string | null>(null)
-  onCloseRef.current = onClose
+  const [visibleRoundCount, setVisibleRoundCount] = useState(40)
+
+  useEffect(() => { onCloseRef.current = onClose }, [onClose])
 
   const relativeTime = (timestamp?: number) => {
     if (!timestamp || !Number.isFinite(timestamp)) return 'Not found'
-    const seconds = Math.max(0, Math.floor((Date.now() - timestamp) / 1000))
+    const seconds = Math.max(0, Math.floor((openedAt - timestamp) / 1000))
     if (seconds < 60) return `${seconds || 1} sec ago`
     if (seconds < 3600) return `${Math.floor(seconds / 60)} min ago`
     if (seconds < 86_400) return `${Math.floor(seconds / 3600)} hr ago`
@@ -83,7 +86,15 @@ export default function HistoryPanel({ rounds, onClose }: HistoryPanelProps) {
         {rounds.length === 0 ? (
           <div className="history-empty">No rounds yet. Play a game to see your history here.</div>
         ) : (
-          <div className="history-list">
+          <div
+            className="history-list"
+            onScroll={event => {
+              const list = event.currentTarget
+              if (list.scrollHeight - list.scrollTop - list.clientHeight < 180) {
+                setVisibleRoundCount(count => Math.min(rounds.length, count + 40))
+              }
+            }}
+          >
             <div className="history-table-head">
               <span>Time</span>
               <span>Stake</span>
@@ -92,7 +103,7 @@ export default function HistoryPanel({ rounds, onClose }: HistoryPanelProps) {
               <span>Payout</span>
               <span>Tx</span>
             </div>
-            {rounds.map((r, i) => {
+            {rounds.slice(0, visibleRoundCount).map((r, i) => {
               const expanded = expandedRoundId === `${r.roundId}-${i}`
               const toggleExpanded = () => setExpandedRoundId(expanded ? null : `${r.roundId}-${i}`)
               return (
@@ -180,7 +191,7 @@ export default function HistoryPanel({ rounds, onClose }: HistoryPanelProps) {
                 </div>
               )
             })}
-            <div className="history-end">No More</div>
+            {visibleRoundCount >= rounds.length && <div className="history-end">No More</div>}
           </div>
         )}
       </div>

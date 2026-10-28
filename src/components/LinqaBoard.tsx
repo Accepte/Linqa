@@ -1,4 +1,4 @@
-import { useEffect, useId, useLayoutEffect, useRef, useState } from 'react'
+import { useId, useLayoutEffect, useRef, useState } from 'react'
 
 export const ARC_MARK_PATH = 'M 75.90 24.30 L 64.80 34.50 L 57.00 44.50 L 47.80 60.80 L 39.40 81.60 L 28.50 124.80 L 24.60 152.90 L 23.10 178.90 L 51.50 178.90 L 56.20 131.00 L 66.20 90.80 L 71.60 76.90 L 80.20 60.70 L 90.30 48.90 L 99.60 44.20 L 105.90 45.00 L 112.10 48.80 L 119.40 56.80 L 127.20 69.20 L 138.80 98.60 L 146.50 134.60 L 119.30 130.70 L 91.50 130.00 L 88.70 144.00 L 87.80 158.00 L 109.50 156.80 L 136.00 159.90 L 156.10 166.20 L 179.20 178.60 L 178.00 152.90 L 170.30 106.40 L 161.00 75.50 L 154.70 60.80 L 145.50 44.50 L 131.60 28.20 L 124.50 22.80 L 112.70 17.40 L 102.50 15.70 L 92.80 16.60 Z'
 export const BADGE_PATH = 'M100 8c14 0 22 12 34 15s27-4 36 6 4 25 10 36 20 17 20 35-14 24-20 35 0 26-10 36-24 3-36 6-20 15-34 15-22-12-34-15-27 4-36-6-4-25-10-36-20-17-20-35 14-24 20-35 0-26 10-36 24-3 36-6 20-15 34-15z'
@@ -126,7 +126,7 @@ export default function LinqaBoard({
     }
 
     setIsProgressing(true)
-    const timeout = window.setTimeout(() => setIsProgressing(false), 500)
+    const timeout = window.setTimeout(() => setIsProgressing(false), 420)
     return () => window.clearTimeout(timeout)
   }, [currentRowIndex])
 

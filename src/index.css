@@ -478,8 +478,8 @@ body {
 .tile--clickable:hover .tile-badge-frame { transform: translateY(-1px) scale(1.04); }
 .tile--clickable:hover .tile-badge { filter: drop-shadow(0 3px 6px rgba(15,28,48,.34)); }
 .tile--safe .tile-badge { --badge-color: #3FBE7C; --badge-logo-color: #E9EDF4; --badge-rim-color: #F2DFB4; filter: drop-shadow(0 0 8px rgba(63,190,124,.64)); }
-.tile--safe .tile-badge-inner { animation: tile-coin-flip .55s cubic-bezier(.33,0,.2,1) 1; }
-.tile--safe .tile-badge__gloss rect { animation: tile-gloss-sweep .55s ease-in-out 1 both; }
+.tile--safe .tile-badge-inner { animation: tile-coin-flip .45s cubic-bezier(.33,0,.2,1) 1; }
+.tile--safe .tile-badge__gloss rect { animation: tile-gloss-sweep .45s ease-in-out 1 both; }
 .tile--losing .tile-badge { --badge-color: #C8495A; --badge-logo-color: #E9EDF4; --badge-rim-color: #141A27; filter: drop-shadow(0 0 9px rgba(200,73,90,.62)); }
 .tile--losing .tile-badge-inner { animation: tile-crack-shake .4s ease-out 1; }
 .tile--losing .tile-badge__crack path { animation: tile-crack-draw .35s ease-out forwards; }
@@ -1837,7 +1837,7 @@ body {
 .board-row--trailing { align-items: flex-start; }
 .board-row--spacer { pointer-events: none; }
 .board-inner--active-flow.board-inner--advancing {
-  animation: linqa-board-roll-down 500ms cubic-bezier(0.16, 1, 0.3, 1) both;
+  animation: linqa-board-roll-down 420ms cubic-bezier(0.16, 1, 0.3, 1) both;
 }
 
 /* Idle ladder stays inside the same board viewport; only the tile ladder

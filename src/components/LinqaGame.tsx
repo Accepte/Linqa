@@ -11,7 +11,6 @@ import { parseAmount, usdcDecimalsFor, Amount } from '@/onchain-money'
 import LinqaBoard, { CONTRACT_ROW_PATTERN, createDemoRowPattern, DEMO_MAX_MULTIPLIER_WAD } from './LinqaBoard'
 import HistoryPanel from './HistoryPanel'
 import HowToPlayPanel from './HowToPlayPanel'
-import LinqaLoader from './LinqaLoader'
 import RoundResultDialog, { type RoundOutcome } from './RoundResultDialog'
 import NoticeBar, { type NoticeBarItem } from './NoticeBar'
 import type { GameRound } from './linqa-types'
@@ -302,7 +301,7 @@ function LinqaActionButton({ label, hoverLabel, variant, onClick, disabled }: Li
   )
 }
 export default function LinqaGame() {
-  const { address, isConnected, isReconnecting, chainId: walletChainId } = useAccount()
+  const { address, isConnected, chainId: walletChainId } = useAccount()
   const { switchChain, switchChainAsync } = useSwitchChain()
 
   const targetChainId = arcTestnet.id
@@ -320,11 +319,9 @@ export default function LinqaGame() {
   const [resultOutcome, setResultOutcome] = useState<RoundOutcome | null>(null)
   const [currentGameId, setCurrentGameId] = useState<string | null>(null)
   const [showHistory, setShowHistory] = useState(false)
+  const [historyOpenedAt, setHistoryOpenedAt] = useState(0)
   const [showHowToPlay, setShowHowToPlay] = useState(false)
   const [showMainnetSoon, setShowMainnetSoon] = useState(false)
-  const [showInitialLoader, setShowInitialLoader] = useState(true)
-  const [showRoundSyncLoader, setShowRoundSyncLoader] = useState(false)
-  const roundSyncStartedAt = useRef<number | null>(null)
   const [historyRounds, setHistoryRounds] = useState<GameRound[]>(readHistory)
   const [activityRounds, setActivityRounds] = useState<GameRound[]>([])
   const [announcements, setAnnouncements] = useState<LiveAnnouncement[]>([])
@@ -343,8 +340,17 @@ export default function LinqaGame() {
   useEffect(() => {
     if (!address || walletChainId !== targetChainId || LOCAL_DEMO_MODE) return
     const controller = new AbortController()
-    setHistoryRounds([])
-    const syncHistory = async () => {
+    let historyLoadSequence = 0
+    const loadSharedHistory = async () => {
+      const requestSequence = ++historyLoadSequence
+      const response = await fetch(`/api/history?wallet=${encodeURIComponent(address)}&limit=2000`, { signal: controller.signal })
+      if (!response.ok) throw new Error(`History service returned ${response.status}`)
+      const body = await response.json() as { rounds?: GameRound[] }
+      if (!controller.signal.aborted && requestSequence === historyLoadSequence) {
+        setHistoryRounds(Array.isArray(body.rounds) ? body.rounds : [])
+      }
+    }
+    const migrateLegacyHistory = async () => {
       const legacyHashes = [...new Set(readHistory()
         .filter(round => round.chainId === targetChainId && round.txHash)
         .map(round => round.txHash as `0x${string}`))].slice(0, 20)
@@ -358,14 +364,16 @@ export default function LinqaGame() {
           }).catch(() => undefined),
         ))
       }
-
-      const response = await fetch(`/api/history?wallet=${encodeURIComponent(address)}&limit=2000`, { signal: controller.signal })
-      if (!response.ok) throw new Error(`History service returned ${response.status}`)
-      const body = await response.json() as { rounds?: GameRound[] }
-      if (!controller.signal.aborted) setHistoryRounds(Array.isArray(body.rounds) ? body.rounds : [])
+      if (legacyHashes.length > 0 && !controller.signal.aborted) await loadSharedHistory()
     }
-    void syncHistory().catch(error => {
+    // Load the visible list immediately. Legacy verification can take several
+    // RPC round trips, so migrate it in the background rather than blocking
+    // the history panel on those checks.
+    void loadSharedHistory().catch(error => {
       if (!controller.signal.aborted) console.warn('Could not load shared round history:', error)
+    })
+    void migrateLegacyHistory().catch(error => {
+      if (!controller.signal.aborted) console.warn('Could not migrate local round history:', error)
     })
     return () => controller.abort()
   }, [address, walletChainId, targetChainId])
@@ -515,7 +523,7 @@ export default function LinqaGame() {
   const usdcAddress = usdc?.address as Address | undefined
 
   // ── Contract reads ──────────────────────────────────────────────────────────
-  const { data: activeRoundData, refetch: refetchRound, isLoading: isCheckingActiveRound } = useReadContract({
+  const { data: activeRoundData, refetch: refetchRound } = useReadContract({
     address: CONTRACT_ADDRESS,
     abi: LINQA_ABI,
     functionName: 'getActiveRound',
@@ -531,31 +539,6 @@ export default function LinqaGame() {
     chainId: targetChainId,
     query: { enabled: !LOCAL_DEMO_MODE && CONTRACT_ADDRESS !== '0x0000000000000000000000000000000000000000' },
   })
-
-  // Show the branded loader only while the app's first critical sync runs.
-  // Later transaction and payout states keep their existing wallet/status UI.
-  const initialSyncStartedAt = useRef(Date.now())
-  useEffect(() => {
-    if (!showInitialLoader) return
-    const hasConfiguredContract = !LOCAL_DEMO_MODE && CONTRACT_ADDRESS !== '0x0000000000000000000000000000000000000000'
-    const isInitialSyncPending = isReconnecting
-      || (hasConfiguredContract && isCheckingGameVersion)
-      || (!!address && hasConfiguredContract && isCheckingActiveRound)
-    if (isInitialSyncPending) return
-
-    const remainingMinimumTime = Math.max(0, 3000 - (Date.now() - initialSyncStartedAt.current))
-    const timer = window.setTimeout(() => setShowInitialLoader(false), remainingMinimumTime)
-    return () => window.clearTimeout(timer)
-  }, [address, isCheckingActiveRound, isCheckingGameVersion, isReconnecting, showInitialLoader])
-
-  useEffect(() => {
-    const failsafe = window.setTimeout(() => setShowInitialLoader(false), 7000)
-    return () => window.clearTimeout(failsafe)
-  }, [])
-
-  useEffect(() => {
-    document.getElementById('linqa-preboot')?.remove()
-  }, [])
 
   const { data: usdcBalance, refetch: refetchBalance } = useReadContract({
     address: usdcAddress,
@@ -750,7 +733,7 @@ export default function LinqaGame() {
             setHasCurrentSecret(!!secretsRef.current[nextRowIndex])
             autoAdvanceRef.current = false
             setRoundPhase('active')
-          }, 550)
+          }, 430)
           return
         }
         void refetchRound().then(({ data }) => {
@@ -774,7 +757,7 @@ export default function LinqaGame() {
               autoAdvanceRef.current = true
               setRoundPhase('result_pending')
             }
-          }, 550)
+          }, 430)
         }).catch(() => {
           setTxPhase('idle')
           setErrorMsg('The tile was revealed, but the latest round state could not be loaded. Refresh before continuing.')
@@ -1322,30 +1305,6 @@ export default function LinqaGame() {
   const isRoundActive = roundPhase === 'active' || roundPhase === 'result_pending' || roundPhase === 'collectable'
   const canCashOut = roundPhase === 'collectable' || (roundPhase === 'active' && currentRowIndex > 0)
   const isBusy = txPhase !== 'idle' || isWritePending || isTxConfirming
-  const isRestoringActiveRound = !!address && isCheckingActiveRound && !isBusy && !resultOutcome
-  useEffect(() => {
-    if (showInitialLoader) return
-    if (isRestoringActiveRound) {
-      if (roundSyncStartedAt.current === null) {
-        roundSyncStartedAt.current = Date.now()
-        setShowRoundSyncLoader(true)
-      }
-      return
-    }
-    if (isBusy || resultOutcome) {
-      roundSyncStartedAt.current = null
-      setShowRoundSyncLoader(false)
-      return
-    }
-    if (roundSyncStartedAt.current === null) return
-
-    const remainingMinimumTime = Math.max(0, 3000 - (Date.now() - roundSyncStartedAt.current))
-    const timer = window.setTimeout(() => {
-      roundSyncStartedAt.current = null
-      setShowRoundSyncLoader(false)
-    }, remainingMinimumTime)
-    return () => window.clearTimeout(timer)
-  }, [isBusy, isRestoringActiveRound, resultOutcome, showInitialLoader])
   const isPlaying = isRoundActive || isBusy || resultOutcome !== null
   const displayMultiplier = formatMultiplier(currentMultiplierWAD)
   const cashoutAmount = (() => {
@@ -1462,6 +1421,9 @@ export default function LinqaGame() {
   }
   const activeNotice = noticeFeed[noticeIndex % noticeFeed.length]
   const activeNoticeDuration = activeNotice.tone === 'warning' ? 6_000 : 4_400
+  const visibleHistoryRounds = address && walletChainId === targetChainId
+    ? historyRounds.filter(round => round.playerAddress?.toLowerCase() === address.toLowerCase())
+    : historyRounds
 
   useEffect(() => {
     setNoticeIndex(0)
@@ -1567,7 +1529,6 @@ export default function LinqaGame() {
 
   return (
     <div className="linqa-root">
-      {(showInitialLoader || showRoundSyncLoader) && <LinqaLoader />}
       {/* ── Header ── */}
       <header className="linqa-header">
         <img className="linqa-logo" src="/linqa-logo.svg" alt="Linqa" />
@@ -1582,7 +1543,11 @@ export default function LinqaGame() {
           </button>
           <button
             className="linqa-icon-btn"
-            onClick={() => { setShowHowToPlay(false); setShowHistory(h => !h) }}
+            onClick={() => {
+              setShowHowToPlay(false)
+              setHistoryOpenedAt(Date.now())
+              setShowHistory(current => !current)
+            }}
             aria-label="History"
             title="Round history"
           >
@@ -1600,14 +1565,14 @@ export default function LinqaGame() {
         </div>
       </header>
 
-      {(activityRounds.length > 0 || historyRounds.length > 0) && !isRoundActive && !isBusy && !resultOutcome && (
+      {(activityRounds.length > 0 || visibleHistoryRounds.length > 0) && !isRoundActive && !isBusy && !resultOutcome && (
         <aside className="recent-activity" aria-label="Recent activities">
           <div className="recent-activity__header">
             <h2>Recent Activities</h2>
-            <button type="button" onClick={() => setShowHistory(true)}>View all</button>
+            <button type="button" onClick={() => { setHistoryOpenedAt(Date.now()); setShowHistory(true) }}>View all</button>
           </div>
           <ul className="recent-activity__list">
-            {(activityRounds.length > 0 ? activityRounds : historyRounds.slice(0, 5)).map(round => {
+            {(activityRounds.length > 0 ? activityRounds : visibleHistoryRounds.slice(0, 5)).map(round => {
               const amount = round.won ? round.payout : round.stake
               const isMine = !!address && round.playerAddress?.toLowerCase() === address.toLowerCase()
               const playerLabel = isMine
@@ -1643,7 +1608,8 @@ export default function LinqaGame() {
       {/* ── History panel ── */}
       {showHistory && (
         <HistoryPanel
-          rounds={historyRounds}
+          rounds={visibleHistoryRounds}
+          openedAt={historyOpenedAt}
           onClose={() => setShowHistory(false)}
         />
       )}
